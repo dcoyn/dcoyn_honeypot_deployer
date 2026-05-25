@@ -242,7 +242,6 @@ AGENT_LOGS=/var/log/$AGENT_NAME
 AGENT_DATA=/var/lib/$AGENT_NAME
 AGENT_ETC=/etc/$AGENT_NAME
 AGENT_REPO_DIR="$AGENT_DATA/store"
-AGENT_USER="$AGENT_NAME"
 
 SVC_MAIN="$AGENT_NAME"
 SVC_CAPTURE="$AGENT_NAME-capture"
@@ -414,16 +413,20 @@ fi
 ok "Source staged at $STAGING (pkg dir: $PKG_NAME)"
 
 # -----------------------------------------------------------------------------
-# 12. Create user, directories, drop the source
+# 12. Create directories, drop the source
 # -----------------------------------------------------------------------------
-log "Creating user $AGENT_USER and directories…"
-id "$AGENT_USER" &>/dev/null || useradd --system --home "$AGENT_DATA" --shell /usr/sbin/nologin "$AGENT_USER"
+# All four services run as root (the main sensor and packet capture both need
+# root anyway to bind privileged ports / open raw sockets, and root-only file
+# ownership avoids cross-user write issues when several services append to the
+# same events.jsonl). The token file is still root:0600 regardless.
+log "Creating directories…"
 
 for d in "$AGENT_HOME" "$AGENT_LOGS" "$AGENT_DATA" "$AGENT_ETC" "$AGENT_REPO_DIR"; do
   mkdir -p "$d"
   CREATED_DIRS+=("$d")
 done
-chown -R "$AGENT_USER:$AGENT_USER" "$AGENT_LOGS" "$AGENT_DATA"
+chown -R root:root "$AGENT_LOGS" "$AGENT_DATA"
+chmod 0750 "$AGENT_LOGS" "$AGENT_DATA"
 
 # Copy source into install root, replacing any prior install
 rm -rf "$AGENT_HOME/$PKG_NAME" "$AGENT_HOME/templates"
@@ -463,8 +466,9 @@ if [[ "$ARG_TYPE" == "owa" ]]; then
     openssl req -x509 -nodes -newkey rsa:2048 \
       -keyout "$AGENT_DATA/owa.key" -out "$AGENT_DATA/owa.crt" \
       -days 730 -subj "/CN=mail.northbridge-logistics.com" 2>/dev/null
-    chown "$AGENT_USER:$AGENT_USER" "$AGENT_DATA/owa."*
+    chown root:root "$AGENT_DATA/owa."*
     chmod 600 "$AGENT_DATA/owa.key"
+    chmod 644 "$AGENT_DATA/owa.crt"
     ok "OWA cert at $AGENT_DATA/owa.crt"
   fi
 fi
@@ -472,7 +476,8 @@ if [[ "$ARG_TYPE" == "ssh" ]]; then
   if [[ ! -f "$AGENT_DATA/ssh_host_rsa_key" ]]; then
     log "Generating sensor SSH host key…"
     ssh-keygen -q -t rsa -b 2048 -f "$AGENT_DATA/ssh_host_rsa_key" -N "" -C "ubuntu-prod-01"
-    chown "$AGENT_USER:$AGENT_USER" "$AGENT_DATA/ssh_host_rsa_key"*
+    chown root:root "$AGENT_DATA/ssh_host_rsa_key"*
+    chmod 600 "$AGENT_DATA/ssh_host_rsa_key"
     ok "SSH host key generated"
   fi
 fi
@@ -486,7 +491,7 @@ if [[ ! -d "$AGENT_REPO_DIR/.git" ]]; then
   # Try clone with retries
   rm -rf "$AGENT_REPO_DIR"
   for attempt in 1 2 3; do
-    if sudo -u "$AGENT_USER" git -C "$AGENT_DATA" clone --quiet "$AUTH_REPO" store 2>/tmp/git-err; then
+    if git -C "$AGENT_DATA" clone --quiet "$AUTH_REPO" store 2>/tmp/git-err; then
       break
     fi
     warn "logs-repo clone failed (attempt $attempt/3): $(head -1 /tmp/git-err 2>/dev/null || true)"
@@ -494,16 +499,16 @@ if [[ ! -d "$AGENT_REPO_DIR/.git" ]]; then
     sleep 3
     if (( attempt == 3 )); then
       warn "Could not clone logs repo — initializing empty + adding remote (push will create branch on first sync)"
-      sudo -u "$AGENT_USER" mkdir -p "$AGENT_REPO_DIR"
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" init --quiet
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" remote add origin "$AUTH_REPO"
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" checkout -b main 2>/dev/null || true
+      mkdir -p "$AGENT_REPO_DIR"
+      git -C "$AGENT_REPO_DIR" init --quiet
+      git -C "$AGENT_REPO_DIR" remote add origin "$AUTH_REPO"
+      git -C "$AGENT_REPO_DIR" checkout -b main 2>/dev/null || true
     fi
   done
 fi
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config user.email "agent@local"
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config user.name  "agent-bot"
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config pull.rebase true
+git -C "$AGENT_REPO_DIR" config user.email "agent@local"
+git -C "$AGENT_REPO_DIR" config user.name  "agent-bot"
+git -C "$AGENT_REPO_DIR" config pull.rebase true
 ok "Logs repo at $AGENT_REPO_DIR"
 
 # -----------------------------------------------------------------------------
@@ -569,8 +574,8 @@ EOF
 INSTALLED_FILES+=("/etc/rsyslog.d/30-$AGENT_NAME.conf")
 systemctl restart rsyslog 2>/dev/null || warn "rsyslog restart failed"
 touch "$AGENT_LOGS/kernel-connections.log"
-chown "$AGENT_USER:adm" "$AGENT_LOGS/kernel-connections.log" 2>/dev/null \
-  || chown "$AGENT_USER:$AGENT_USER" "$AGENT_LOGS/kernel-connections.log"
+chown root:adm "$AGENT_LOGS/kernel-connections.log" 2>/dev/null \
+  || chown root:root "$AGENT_LOGS/kernel-connections.log"
 
 # Per-agent env file (read by systemd)
 cat > "$AGENT_ETC/env" <<EOF
@@ -643,7 +648,7 @@ After=rsyslog.service
 
 [Service]
 Type=simple
-User=$AGENT_USER
+User=root
 WorkingDirectory=$AGENT_HOME
 EnvironmentFile=$AGENT_ETC/env
 ExecStart=$AGENT_HOME/venv/bin/python -m ${PKG_NAME}.network.connection_logger

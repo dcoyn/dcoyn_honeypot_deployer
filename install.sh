@@ -22,8 +22,12 @@
 #  Environment variables (all optional, defaults listed in -h output):
 #      HP_TYPE            ssh|owa|winserver|random       (sensor profile)
 #      HP_AGENT_NAME      kworker-[a-z0-9]{1,4}          (force a specific name)
-#      HP_REPO            https://github.com/.../X.git   (the logs repo)
-#      HP_GIT_TOKEN       ghp_…                          (PAT for the logs repo)
+#      HP_REPO            git URL of THIS node's repo
+#                          (e.g. https://github.com/dcoyn/dcoyn_honeypot_logs.git
+#                          — you create one private repo per VM in the GitHub UI)
+#      HP_GIT_TOKEN       ghp_…                          (PAT scoped to ONLY
+#                                                          that one node repo,
+#                                                          Contents: r/w)
 #      HP_INSTALL_TOKEN   ghp_…                          (PAT for the deployer
 #                                                          repo, if private;
 #                                                          falls back to
@@ -78,19 +82,30 @@ INSTALL_FAILED=0
 
 on_error() {
   local lineno="$1" rc="$2" cmd="$3"
+  # First thing: disarm so any failing diagnostic command below can't re-enter
+  # this trap and produce a cascade of nested error messages.
+  trap '' ERR
+  set +eE
+  set +o pipefail
+
   INSTALL_FAILED=1
   err "--------------------------------------------------------------------"
   err "Install failed at line ${lineno}: '${cmd}' (exit ${rc})"
   err "Log file: ${INSTALL_LOG}"
-  err "Last 20 lines of output:"
-  tail -n 20 "$INSTALL_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
+  err "Last 15 lines of output:"
+  # All diagnostic commands are made bulletproof with || true so they can't
+  # cause more noise.
+  tail -n 15 "$INSTALL_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
   err "--------------------------------------------------------------------"
-  err "Re-run with set -x for verbose tracing, or inspect ${INSTALL_LOG}."
+  err "Re-run with bash -x for verbose tracing, or inspect ${INSTALL_LOG}."
   if (( ${#INSTALLED_UNITS[@]} > 0 )); then
     err "Partial install was performed. To clean up, run:"
-    err "  sudo bash ${INSTALL_LOG%/install*}/uninstall.sh $AGENT_NAME"
-    err "  (or manually stop: ${INSTALLED_UNITS[*]})"
+    err "  sudo bash uninstall.sh ${AGENT_NAME:-}"
   fi
+  # IMPORTANT: explicit exit so the script stops here. Without this, bash
+  # behavior with ERR traps + set -e is version-dependent and the script
+  # may keep going past the failure.
+  exit "${rc:-1}"
 }
 trap 'on_error "${LINENO}" "$?" "${BASH_COMMAND}"' ERR
 
@@ -158,11 +173,21 @@ esac
 # -----------------------------------------------------------------------------
 # 4. Pick agent name: kworker-XXXX (1-4 lowercase alphanumeric chars)
 # -----------------------------------------------------------------------------
+# Pure-bash random string generator. We don't use `tr -dc … </dev/urandom |
+# head -c N` because under `set -o pipefail` the early-closing pipe sends
+# SIGPIPE to `tr`, which surfaces as exit code 141 and kills the script.
+# $RANDOM is plenty of entropy for picking an opaque agent name.
+_rand_alnum() {
+  local len="$1" chars='abcdefghijklmnopqrstuvwxyz0123456789' i out=''
+  for (( i = 0; i < len; i++ )); do
+    out+="${chars:RANDOM%36:1}"
+  done
+  printf '%s' "$out"
+}
+
 _gen_agent_name() {
-  local len suffix
-  len=$(shuf -i 1-4 -n 1)
-  suffix=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c "$len")
-  echo "kworker-${suffix}"
+  local len=$(( (RANDOM % 4) + 1 ))
+  printf 'kworker-%s' "$(_rand_alnum "$len")"
 }
 
 AGENT_NAME="${HP_AGENT_NAME:-}"
@@ -189,19 +214,25 @@ if id "$AGENT_NAME" &>/dev/null && [[ -d "/opt/$AGENT_NAME" ]] && [[ "${HP_NONIN
 fi
 
 # -----------------------------------------------------------------------------
-# 5. Collect logs-repo creds (the GitHub PAT) — fail fast if missing
+# 5. Collect per-node repo URL + its dedicated token
 # -----------------------------------------------------------------------------
+# Each VM pushes to its OWN private GitHub repo (e.g. dcoyn/dcoyn_honeypot_logs,
+# dcoyn/dcoyn_honeypot_logs2, …). Create the repo yourself in the GitHub UI
+# (private, with "Initialize with a README" checked), generate a fine-grained
+# PAT scoped to ONLY that repo with Contents: Read+write, and paste the URL
+# and token here. This way a compromise of one honeypot leaks at most ONE
+# repo's worth of data.
 REPO="${HP_REPO:-}"
 TOKEN="${HP_GIT_TOKEN:-}"
-NODE_NAME="${HP_NODE_NAME:-$(hostname)-$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c6)}"
+NODE_NAME="${HP_NODE_NAME:-$(hostname)-$(_rand_alnum 6)}"
 
 if [[ -z "$REPO" ]]; then
-  [[ "${HP_NONINTERACTIVE:-0}" == "1" ]] && die "HP_REPO is required."
-  read -rp "Private GitHub logs repo URL: " REPO
+  [[ "${HP_NONINTERACTIVE:-0}" == "1" ]] && die "HP_REPO is required (the per-node GitHub repo URL)."
+  read -rp "Per-node GitHub repo URL (https://github.com/dcoyn/dcoyn_honeypot_logsN.git): " REPO
 fi
 if [[ -z "$TOKEN" ]]; then
   [[ "${HP_NONINTERACTIVE:-0}" == "1" ]] && die "HP_GIT_TOKEN is required."
-  read -rsp "GitHub fine-grained PAT (contents r/w): " TOKEN; echo
+  read -rsp "Fine-grained PAT for THAT repo (Contents r/w): " TOKEN; echo
 fi
 
 [[ "$REPO" =~ ^https://github\.com/.+\.git$ ]] || warn "Repo URL doesn't look like an https git URL: $REPO"
@@ -221,7 +252,6 @@ AGENT_LOGS=/var/log/$AGENT_NAME
 AGENT_DATA=/var/lib/$AGENT_NAME
 AGENT_ETC=/etc/$AGENT_NAME
 AGENT_REPO_DIR="$AGENT_DATA/store"
-AGENT_USER="$AGENT_NAME"
 
 SVC_MAIN="$AGENT_NAME"
 SVC_CAPTURE="$AGENT_NAME-capture"
@@ -233,11 +263,13 @@ DESC_CAPTURE="Workqueue packet inspector"
 DESC_CONNLOG="Connection state worker"
 DESC_SYNC="Worker state synchronization"
 
-# Detect local checkout (script run from its own repo) — preferred over remote fetch
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+# Detect local checkout (script run from its own repo) — preferred over remote fetch.
+# When the script is piped from curl, BASH_SOURCE[0] may be unset; use :- to
+# avoid tripping `set -u`.
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-}" 2>/dev/null || true)"
 SCRIPT_DIR="${SCRIPT_PATH%/*}"
 LOCAL_SRC=""
-if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_DIR/nodewatch/sensors/ssh_sensor.py" ]]; then
+if [[ -n "${SCRIPT_PATH:-}" && -f "$SCRIPT_DIR/nodewatch/sensors/ssh_sensor.py" ]]; then
   LOCAL_SRC="$SCRIPT_DIR"
 fi
 
@@ -366,7 +398,7 @@ else
     if git clone --depth 1 --quiet "$AUTH_INSTALL_REPO" "$STAGING/_repo" 2>/tmp/git-err; then
       break
     fi
-    warn "git clone failed (attempt $attempt/3): $(cat /tmp/git-err | head -1)"
+    warn "git clone failed (attempt $attempt/3): $(head -1 /tmp/git-err 2>/dev/null || true)"
     sleep 3
     rm -rf "$STAGING/_repo"
     (( attempt == 3 )) && die "Cannot clone deployer repo $INSTALL_REPO (check HP_INSTALL_TOKEN/HP_GIT_TOKEN access)."
@@ -391,22 +423,75 @@ fi
 ok "Source staged at $STAGING (pkg dir: $PKG_NAME)"
 
 # -----------------------------------------------------------------------------
-# 12. Create user, directories, drop the source
+# 12. Create privsep users, group, and directories
 # -----------------------------------------------------------------------------
-log "Creating user $AGENT_USER and directories…"
-id "$AGENT_USER" &>/dev/null || useradd --system --home "$AGENT_DATA" --shell /usr/sbin/nologin "$AGENT_USER"
+# Privilege model: each service runs as the least-privileged identity that
+# can do its job. A shared group ($AGENT_NAME-rw) owns the log dir with the
+# setgid bit so any service can append to the shared events.jsonl without
+# anyone needing root just for file ownership.
+#
+#   sensor-user        runs the main sensor + packet capture
+#                      gets CAP_NET_BIND_SERVICE + CAP_NET_RAW via systemd
+#                      (NOT a root process — has fewer privileges than root)
+#
+#   connlog-user       runs the connection-log tailer
+#                      member of the shared rw group + 'adm' (rsyslog group)
+#                      NO capabilities, just reads a text file and writes events
+#
+#   sync-user          runs the every-5-minute git push
+#                      has the ONLY filesystem access to the GitHub token
+#                      NO capabilities, NO read of the live log files except
+#                      via the aggregator
+#
+# A successful RCE in any one service is contained — the attacker would have
+# to chain a local privilege escalation to reach the others.
+
+SENSOR_USER="$AGENT_NAME-s"
+CONNLOG_USER="$AGENT_NAME-c"
+SYNC_USER="$AGENT_NAME-y"
+SHARED_GROUP="$AGENT_NAME-rw"
+
+log "Creating privsep accounts and directories…"
+
+getent group  "$SHARED_GROUP"   >/dev/null || groupadd --system "$SHARED_GROUP"
+id            "$SENSOR_USER"    &>/dev/null || useradd --system --no-create-home \
+    --home "$AGENT_DATA" --shell /usr/sbin/nologin -g "$SHARED_GROUP" "$SENSOR_USER"
+id            "$CONNLOG_USER"   &>/dev/null || useradd --system --no-create-home \
+    --home "$AGENT_DATA" --shell /usr/sbin/nologin -g "$SHARED_GROUP" "$CONNLOG_USER"
+id            "$SYNC_USER"      &>/dev/null || useradd --system --no-create-home \
+    --home "$AGENT_DATA" --shell /usr/sbin/nologin -g "$SHARED_GROUP" "$SYNC_USER"
+
+# Add connlog user to 'adm' so it can read the rsyslog-written kernel log
+usermod -a -G adm "$CONNLOG_USER" 2>/dev/null || true
 
 for d in "$AGENT_HOME" "$AGENT_LOGS" "$AGENT_DATA" "$AGENT_ETC" "$AGENT_REPO_DIR"; do
   mkdir -p "$d"
   CREATED_DIRS+=("$d")
 done
-chown -R "$AGENT_USER:$AGENT_USER" "$AGENT_LOGS" "$AGENT_DATA"
+
+# Log directory: setgid so new files inherit the shared group
+chown -R root:"$SHARED_GROUP" "$AGENT_LOGS"
+chmod 2770 "$AGENT_LOGS"
+# Existing per-session/event files (re-runs) need group write
+find "$AGENT_LOGS" -type f -exec chmod g+w {} \; 2>/dev/null || true
+
+# Data dir: root-owned, only sync-user can read it (where the token lives)
+chown -R root:"$SYNC_USER" "$AGENT_DATA"
+chmod 0750 "$AGENT_DATA"
+
+# Repo dir inside data: writable by sync user
+chown -R "$SYNC_USER":"$SYNC_USER" "$AGENT_REPO_DIR"
+chmod 0700 "$AGENT_REPO_DIR"
+
+# Install root: readable by everyone, writable by no one
+chmod 0755 "$AGENT_HOME"
 
 # Copy source into install root, replacing any prior install
 rm -rf "$AGENT_HOME/$PKG_NAME" "$AGENT_HOME/templates"
 cp -r "$STAGING/$PKG_NAME"  "$AGENT_HOME/"
 cp -r "$STAGING/templates"  "$AGENT_HOME/"
 cp    "$STAGING/requirements.txt" "$AGENT_HOME/"
+chown -R root:root "$AGENT_HOME/$PKG_NAME" "$AGENT_HOME/templates" "$AGENT_HOME/requirements.txt"
 ok "Source installed at $AGENT_HOME/$PKG_NAME"
 
 # -----------------------------------------------------------------------------
@@ -434,14 +519,18 @@ ok "Python deps installed"
 # -----------------------------------------------------------------------------
 # 14. Sensor-specific assets: cert for OWA, host key for SSH
 # -----------------------------------------------------------------------------
+# These are read by the sensor process. Owned by root, readable by the sensor
+# user (via group). The private keys stay 0640 — the sensor needs to read
+# them, nothing else should.
 if [[ "$ARG_TYPE" == "owa" ]]; then
   if [[ ! -f "$AGENT_DATA/owa.crt" ]]; then
     log "Generating self-signed cert for OWA…"
     openssl req -x509 -nodes -newkey rsa:2048 \
       -keyout "$AGENT_DATA/owa.key" -out "$AGENT_DATA/owa.crt" \
       -days 730 -subj "/CN=mail.northbridge-logistics.com" 2>/dev/null
-    chown "$AGENT_USER:$AGENT_USER" "$AGENT_DATA/owa."*
-    chmod 600 "$AGENT_DATA/owa.key"
+    chown root:"$SENSOR_USER" "$AGENT_DATA/owa.key" "$AGENT_DATA/owa.crt"
+    chmod 0640 "$AGENT_DATA/owa.key"
+    chmod 0644 "$AGENT_DATA/owa.crt"
     ok "OWA cert at $AGENT_DATA/owa.crt"
   fi
 fi
@@ -449,39 +538,41 @@ if [[ "$ARG_TYPE" == "ssh" ]]; then
   if [[ ! -f "$AGENT_DATA/ssh_host_rsa_key" ]]; then
     log "Generating sensor SSH host key…"
     ssh-keygen -q -t rsa -b 2048 -f "$AGENT_DATA/ssh_host_rsa_key" -N "" -C "ubuntu-prod-01"
-    chown "$AGENT_USER:$AGENT_USER" "$AGENT_DATA/ssh_host_rsa_key"*
+    chown root:"$SENSOR_USER" "$AGENT_DATA/ssh_host_rsa_key"*
+    chmod 0640 "$AGENT_DATA/ssh_host_rsa_key"
+    chmod 0644 "$AGENT_DATA/ssh_host_rsa_key.pub" 2>/dev/null || true
     ok "SSH host key generated"
   fi
 fi
 
 # -----------------------------------------------------------------------------
-# 15. Initialize logs repo
+# 15. Initialize logs repo (owned by sync-user — the only one who needs it)
 # -----------------------------------------------------------------------------
-log "Cloning logs repo $REPO…"
+# -----------------------------------------------------------------------------
+log "Cloning per-node repo $REPO…"
 AUTH_REPO=$(echo "$REPO" | sed "s|https://|https://x-access-token:${TOKEN}@|")
 if [[ ! -d "$AGENT_REPO_DIR/.git" ]]; then
-  # Try clone with retries
   rm -rf "$AGENT_REPO_DIR"
   for attempt in 1 2 3; do
-    if sudo -u "$AGENT_USER" git -C "$AGENT_DATA" clone --quiet "$AUTH_REPO" store 2>/tmp/git-err; then
+    if sudo -u "$SYNC_USER" git -C "$AGENT_DATA" clone --quiet "$AUTH_REPO" store 2>/tmp/git-err; then
       break
     fi
-    warn "logs-repo clone failed (attempt $attempt/3): $(cat /tmp/git-err | head -1)"
+    warn "node-repo clone failed (attempt $attempt/3): $(head -1 /tmp/git-err 2>/dev/null || true)"
     rm -rf "$AGENT_REPO_DIR"
     sleep 3
     if (( attempt == 3 )); then
-      warn "Could not clone logs repo — initializing empty + adding remote (push will create branch on first sync)"
-      sudo -u "$AGENT_USER" mkdir -p "$AGENT_REPO_DIR"
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" init --quiet
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" remote add origin "$AUTH_REPO"
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" checkout -b main 2>/dev/null || true
+      warn "Could not clone node repo — initializing empty + adding remote (push will create branch on first sync)"
+      sudo -u "$SYNC_USER" mkdir -p "$AGENT_REPO_DIR"
+      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" init --quiet
+      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" remote add origin "$AUTH_REPO"
+      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" checkout -b main 2>/dev/null || true
     fi
   done
 fi
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config user.email "agent@local"
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config user.name  "agent-bot"
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config pull.rebase true
-ok "Logs repo at $AGENT_REPO_DIR"
+sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config user.email "agent@local"
+sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config user.name  "agent-bot"
+sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config pull.rebase true
+ok "Per-node repo at $AGENT_REPO_DIR"
 
 # -----------------------------------------------------------------------------
 # 16. Write config and env file
@@ -501,9 +592,10 @@ EOF
 chmod 0644 "$AGENT_HOME/config.json"
 
 # Token: root-only
-install -m 0600 /dev/null "$AGENT_DATA/.token"
+install -m 0400 /dev/null "$AGENT_DATA/.token"
 echo "$TOKEN" > "$AGENT_DATA/.token"
-chown root:root "$AGENT_DATA/.token"
+chown "$SYNC_USER":"$SYNC_USER" "$AGENT_DATA/.token"
+chmod 0400 "$AGENT_DATA/.token"
 
 # -----------------------------------------------------------------------------
 # 17. nftables: log every new connection attempt (incl. closed ports)
@@ -546,8 +638,8 @@ EOF
 INSTALLED_FILES+=("/etc/rsyslog.d/30-$AGENT_NAME.conf")
 systemctl restart rsyslog 2>/dev/null || warn "rsyslog restart failed"
 touch "$AGENT_LOGS/kernel-connections.log"
-chown "$AGENT_USER:adm" "$AGENT_LOGS/kernel-connections.log" 2>/dev/null \
-  || chown "$AGENT_USER:$AGENT_USER" "$AGENT_LOGS/kernel-connections.log"
+chown root:adm "$AGENT_LOGS/kernel-connections.log" 2>/dev/null \
+  || chown root:root "$AGENT_LOGS/kernel-connections.log"
 
 # Per-agent env file (read by systemd)
 cat > "$AGENT_ETC/env" <<EOF
@@ -577,18 +669,39 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=$SENSOR_USER
+Group=$SHARED_GROUP
+UMask=0002
 WorkingDirectory=$AGENT_HOME
 EnvironmentFile=$AGENT_ETC/env
 Environment=PYTHONUNBUFFERED=1
 ExecStart=$AGENT_HOME/venv/bin/python -m ${PKG_NAME}.runner
 Restart=always
 RestartSec=3
+
+# Capabilities: bind to ports below 1024, nothing else
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Sandboxing
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=$AGENT_LOGS $AGENT_DATA
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
 PrivateTmp=true
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Filesystem: read its source, append to logs, read its cert/key
+ReadOnlyPaths=$AGENT_HOME
+ReadWritePaths=$AGENT_LOGS
+ReadOnlyPaths=$AGENT_DATA
 
 [Install]
 WantedBy=multi-user.target
@@ -602,12 +715,37 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=$SENSOR_USER
+Group=$SHARED_GROUP
+UMask=0002
 WorkingDirectory=$AGENT_HOME
 EnvironmentFile=$AGENT_ETC/env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=$AGENT_HOME/venv/bin/python -m ${PKG_NAME}.network.packet_capture
 Restart=always
 RestartSec=5
+
+# Capabilities: open raw sockets for sniffing
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+ReadOnlyPaths=$AGENT_HOME
+ReadWritePaths=$AGENT_LOGS
 
 [Install]
 WantedBy=multi-user.target
@@ -620,12 +758,37 @@ After=rsyslog.service
 
 [Service]
 Type=simple
-User=$AGENT_USER
+User=$CONNLOG_USER
+Group=$SHARED_GROUP
+UMask=0002
+SupplementaryGroups=adm
 WorkingDirectory=$AGENT_HOME
 EnvironmentFile=$AGENT_ETC/env
 ExecStart=$AGENT_HOME/venv/bin/python -m ${PKG_NAME}.network.connection_logger
 Restart=always
 RestartSec=3
+
+# No capabilities — this just reads a text file
+CapabilityBoundingSet=
+
+# Sandboxing — most restrictive of all the services
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+ReadOnlyPaths=$AGENT_HOME
+ReadWritePaths=$AGENT_LOGS
 
 [Install]
 WantedBy=multi-user.target
@@ -637,10 +800,35 @@ Description=$DESC_SYNC
 
 [Service]
 Type=oneshot
-User=root
+User=$SYNC_USER
+Group=$SYNC_USER
+UMask=0002
+SupplementaryGroups=$SHARED_GROUP
 WorkingDirectory=$AGENT_HOME
 EnvironmentFile=$AGENT_ETC/env
 ExecStart=$AGENT_HOME/venv/bin/python -m ${PKG_NAME}.sync.github_sync
+
+# No capabilities — only does network egress and filesystem reads
+CapabilityBoundingSet=
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Sync needs: read events.jsonl, read the token, read+write the repo dir
+ReadOnlyPaths=$AGENT_HOME $AGENT_LOGS
+ReadWritePaths=$AGENT_REPO_DIR
 EOF
 
 _write_unit /etc/systemd/system/${SVC_SYNC}.timer <<EOF

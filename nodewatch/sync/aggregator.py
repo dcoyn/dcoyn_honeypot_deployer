@@ -1,25 +1,27 @@
 """
-nodewatch.sync.aggregator
-========================
+sync.aggregator
+===============
 
-Reads events.jsonl, produces the "saleable" log layout in the repo:
+Reads events.jsonl and writes this node's view into the per-node repo.
 
-  events/YYYY/MM/DD/<node>-HH.jsonl       raw events (append-only, gz'd)
-  ips/<ip>.json                            rolling IP profile
-  sessions/<session_id>.json               per-session summary
-  index/by-asn.json                        ASN → IPs we've seen
-  index/by-country.json                    country → IPs
-  index/by-ja4.json                        JA4 fingerprint → IPs
-  index/credentials.jsonl                  every credential ever tried
-  index/commands.jsonl                     every SSH command ever run
-  nodes/<node>.json                        per-node heartbeat / counters
+Per-node repo layout (one repo per VM):
 
-Idempotent: safe to re-run. Tracks the last-processed event by
-event_id in $DATA/aggregator_state.json.
+  events/YYYY/MM/DD/<node>-HH.jsonl   raw events (append-only)
+  ips/<ip>.json                        this node's view of that IP
+  sessions/<sid>.json                  sessions this node observed
+  node.json                            this node's heartbeat + counters
+
+Cross-node aggregation (consolidated `ips/` across the whole fleet, ASN
+indexes, credential corpus, JA4 indexes, command corpora) is performed by
+a SEPARATE central aggregator — see tools/central_aggregator.py in the
+deployer repo. That tool clones every per-node repo and folds them into a
+single intel repo.
+
+Idempotent: tracks the last-processed byte of events.jsonl in
+$DATA/aggregator_state.json.
 """
 from __future__ import annotations
 
-import gzip
 import json
 import os
 from collections import defaultdict
@@ -57,12 +59,6 @@ def _atomic_write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
-def _append_jsonl(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
-
-
 def _load_json(path: Path, default):
     if not path.exists():
         return default
@@ -83,14 +79,9 @@ def run() -> dict:
     state       = _load_json(state_path, {"pos": 0})
     start_pos   = state.get("pos", 0)
 
-    # Per-batch buffers we'll merge into on-disk artifacts at the end
-    ip_updates:      dict[str, dict] = defaultdict(dict)
-    sess_updates:    dict[str, dict] = defaultdict(dict)
-    asn_index:       dict[str, set]  = defaultdict(set)
-    country_index:   dict[str, set]  = defaultdict(set)
-    ja4_index:       dict[str, set]  = defaultdict(set)
-    creds:           list = []
-    commands:        list = []
+    # Per-batch buffers
+    ip_updates:    dict[str, dict] = defaultdict(dict)
+    sess_updates:  dict[str, dict] = defaultdict(dict)
     raw_hour_buckets: dict[str, list] = defaultdict(list)
 
     new_pos = start_pos
@@ -104,7 +95,7 @@ def run() -> dict:
         data = ev.get("data") or {}
         geo  = data.get("geo") or {}
 
-        # ---- raw by hour ---
+        # ---- raw events by hour ---
         try:
             dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
         except Exception:
@@ -112,7 +103,7 @@ def run() -> dict:
         bucket = f"events/{dt:%Y/%m/%d}/{cfg.node_name}-{dt:%H}.jsonl"
         raw_hour_buckets[bucket].append(ev)
 
-        # ---- ip profile ---
+        # ---- IP profile (this node's view) ---
         ipd = ip_updates[ip]
         ipd.setdefault("ip", ip)
         ipd.setdefault("first_seen", ts)
@@ -129,55 +120,29 @@ def run() -> dict:
         ipd.setdefault("sessions", set())
         if sid:
             ipd["sessions"].add(sid)
-        ipd.setdefault("nodes", set())
-        if ev.get("node_name"):
-            ipd["nodes"].add(ev["node_name"])
-        # enrichment is whatever we last saw
         if geo:
             ipd["geo"] = geo
-            if geo.get("country"):  country_index[geo["country"]].add(ip)
-            if geo.get("asn"):      asn_index[str(geo["asn"])].add(ip)
 
-        # User agents seen
         ua = data.get("user_agent")
         if ua:
             ipd.setdefault("user_agents", set()).add(ua[:300])
 
-        # TLS fingerprints
         if et == "tls_fingerprint":
             ja4 = data.get("ja4")
             if ja4:
                 ipd.setdefault("ja4", set()).add(ja4)
-                ja4_index[ja4].add(ip)
             if data.get("ja3_hash"):
                 ipd.setdefault("ja3", set()).add(data["ja3_hash"])
 
-        # Credentials
         if et in ("ssh_auth", "ssh_login_ok", "http_login"):
-            entry = {
-                "ts": ts, "ip": ip, "session_id": sid, "sensor": ev.get("sensor_profile"),
-                "username": data.get("username"),
-                "password": data.get("password"),
-                "method":   data.get("method") or ("password" if et != "ssh_login_ok" else "password"),
-                "accepted": bool(data.get("accepted")) or et == "ssh_login_ok",
-            }
-            creds.append(entry)
-            ipd.setdefault("cred_attempts", 0)
-            ipd["cred_attempts"] += 1
-            if entry["accepted"]:
+            ipd["cred_attempts"] = ipd.get("cred_attempts", 0) + 1
+            if data.get("accepted") or et == "ssh_login_ok":
                 ipd["cred_successes"] = ipd.get("cred_successes", 0) + 1
 
-        # Commands
         if et == "ssh_command":
-            cmd_entry = {
-                "ts": ts, "ip": ip, "session_id": sid,
-                "command": data.get("command"), "mode": data.get("mode"),
-            }
-            commands.append(cmd_entry)
-            ipd.setdefault("commands_run", 0)
-            ipd["commands_run"] += 1
+            ipd["commands_run"] = ipd.get("commands_run", 0) + 1
 
-        # ---- session ---
+        # ---- session summary ---
         if sid:
             sd = sess_updates[sid]
             sd.setdefault("session_id", sid)
@@ -188,7 +153,6 @@ def run() -> dict:
             sd.setdefault("event_types", {})
             sd["event_types"][et] = sd["event_types"].get(et, 0) + 1
             sd.setdefault("sensor", ev.get("sensor_profile"))
-            sd.setdefault("node", ev.get("node_name"))
             if et == "ssh_command" and data.get("command"):
                 sd.setdefault("commands", []).append(data["command"])
             if et == "ssh_login_ok":
@@ -200,7 +164,7 @@ def run() -> dict:
                 sd.setdefault("user_agent", data["user_agent"])
 
     # ----------------------------------------------------------------- merge
-    # Raw events: append to repo, then optionally gzip the previous hour
+    # Raw events to per-hour files
     for bucket, events in raw_hour_buckets.items():
         out = repo / bucket
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -208,32 +172,26 @@ def run() -> dict:
             for ev in events:
                 f.write(json.dumps(ev, ensure_ascii=False, separators=(",", ":"), default=str) + "\n")
 
-    # IP profiles: merge with existing
+    # IP profiles (this-node view)
     for ip, upd in ip_updates.items():
         path = repo / "ips" / f"{ip}.json"
         existing = _load_json(path, {})
-        # set-typed fields -> lists for JSON
-        for k in ("ports_hit", "sensors", "sessions", "nodes",
-                  "user_agents", "ja3", "ja4"):
+        for k in ("ports_hit", "sensors", "sessions", "user_agents", "ja3", "ja4"):
             if k in upd and isinstance(upd[k], set):
                 upd[k] = sorted(upd[k])
             if k in existing and isinstance(existing[k], list):
                 merged = set(existing[k]) | set(upd.get(k, []))
                 upd[k] = sorted(merged)
-        # merge counters
         for k in ("event_count", "cred_attempts", "cred_successes", "commands_run"):
             if k in upd:
                 upd[k] = existing.get(k, 0) + upd.get(k, 0)
-        # merge event_types dict
         if "event_types" in upd:
             merged = dict(existing.get("event_types", {}))
             for k, v in upd["event_types"].items():
                 merged[k] = merged.get(k, 0) + v
             upd["event_types"] = merged
-        # first_seen wins from existing if earlier
         if existing.get("first_seen") and existing["first_seen"] < upd.get("first_seen", "9"):
             upd["first_seen"] = existing["first_seen"]
-        # carry geo if not in update
         if "geo" not in upd and "geo" in existing:
             upd["geo"] = existing["geo"]
         _atomic_write_json(path, upd)
@@ -255,36 +213,23 @@ def run() -> dict:
             upd["commands"] = (existing.get("commands", []) + upd["commands"])[-5000:]
         _atomic_write_json(path, upd)
 
-    # Indices
-    def _merge_index(path: Path, updates: dict[str, set]):
-        existing = _load_json(path, {})
-        for k, ips in updates.items():
-            cur = set(existing.get(k, []))
-            cur |= ips
-            existing[k] = sorted(cur)
-        _atomic_write_json(path, existing)
-
-    _merge_index(repo / "index" / "by-asn.json",      asn_index)
-    _merge_index(repo / "index" / "by-country.json",  country_index)
-    _merge_index(repo / "index" / "by-ja4.json",      ja4_index)
-
-    # Append-only feeds
-    for c in creds:
-        _append_jsonl(repo / "index" / "credentials.jsonl", c)
-    for cmd in commands:
-        _append_jsonl(repo / "index" / "commands.jsonl", cmd)
-
-    # Node heartbeat
-    node_path = repo / "nodes" / f"{cfg.node_name}.json"
-    nd = _load_json(node_path, {"node": cfg.node_name})
-    nd["last_aggregated_at"] = datetime.now(timezone.utc).isoformat()
-    nd["sensor_profile"] = cfg.sensor_profile
+    # Node heartbeat (single file — this repo is one node)
+    node_path = repo / "node.json"
+    nd = _load_json(node_path, {})
+    nd.update({
+        "node_name":      cfg.node_name,
+        "sensor_profile": cfg.sensor_profile,
+        "last_aggregated_at": datetime.now(timezone.utc).isoformat(),
+    })
     nd["total_events"] = nd.get("total_events", 0) + n_events
     _atomic_write_json(node_path, nd)
 
-    # Persist position
-    _atomic_write_json(state_path, {"pos": new_pos, "last_run": nd["last_aggregated_at"],
-                                    "last_count": n_events})
+    # Persist read position
+    _atomic_write_json(state_path, {
+        "pos": new_pos,
+        "last_run": nd["last_aggregated_at"],
+        "last_count": n_events,
+    })
 
     return {"events_processed": n_events, "new_pos": new_pos}
 

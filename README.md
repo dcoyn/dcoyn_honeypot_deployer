@@ -36,6 +36,65 @@ not the file paths. (Verified by the test suite.) The word `honeypot` only
 appears in the operator-facing repo name (`dcoyn/dcoyn_honeypot_deployer`) and in
 backward-compat code that reads old config files.
 
+## Architecture
+
+```
+   ┌─────────────┐        ┌─────────────┐        ┌─────────────┐
+   │  VM #1      │        │  VM #2      │        │  VM #N      │
+   │  kworker-ab │        │  kworker-x4 │        │  kworker-q3 │
+   └──────┬──────┘        └──────┬──────┘        └──────┬──────┘
+          │                      │                       │
+          │ git push every 5min  │                       │
+          ▼                      ▼                       ▼
+   ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+   │ dcoyn_honeypot_  │  │ dcoyn_honeypot_  │  │ dcoyn_honeypot_  │
+   │ node_kworker_ab  │  │ node_kworker_x4  │  │ node_kworker_q3  │
+   └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
+            │                     │                       │
+            └─────────────────────┼───────────────────────┘
+                                  │
+                  central_aggregator.py (cron / GH Action)
+                                  │
+                                  ▼
+                       ┌──────────────────┐
+                       │ dcoyn_honeypot_  │   ← consolidated intel
+                       │ logs             │     ips/, sessions/, indexes
+                       └──────────────────┘
+```
+
+**Per-node repos** (one per VM, auto-created at install time): cheap clones,
+no push contention, isolated blast radius. Each VM only has access to its own
+repo's token.
+
+**Central intel repo** (`dcoyn_honeypot_logs`): built by the `aggregate.py` script in `dcoyn_honeypot_intel`
+running anywhere with `GH_TOKEN`. Pulls every per-node repo, folds them into
+consolidated IP profiles, cross-node indexes, credential and command corpora.
+
+## Privilege separation
+
+Each of the four services on a sensor node runs as a separate unprivileged
+account with only the capabilities it needs. An RCE in any one service is
+contained — the attacker has to chain a local privilege escalation to reach
+the others. Per agent name `kworker-XXXX` the installer creates:
+
+| Identity | Runs | Privileges | Filesystem |
+|---|---|---|---|
+| `kworker-XXXX-s` | Main sensor + packet capture | `CAP_NET_BIND_SERVICE`, `CAP_NET_RAW`, `CAP_NET_ADMIN` | RO source, RW logs, RO cert+key |
+| `kworker-XXXX-c` | Connection log tailer | NONE (no caps, `PrivateNetwork`) | RO source, RW logs, RO kernel log |
+| `kworker-XXXX-y` | Periodic git push | NONE | RO logs, RW repo dir, RO token |
+| `kworker-XXXX-rw` (group) | Setgid on log dir so all writers can append to `events.jsonl` | — | — |
+
+The GitHub token (`/var/lib/kworker-XXXX/.token`) is mode `0400`, owned by the
+sync user only. The sensor processes (which parse hostile input all day)
+cannot read it. The connlog process has `PrivateNetwork=true` so even if RCE'd
+it can't exfiltrate over the network from within its own service.
+
+`NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`,
+`PrivateTmp=true`, `PrivateDevices=true`, `ProtectKernelTunables=true`,
+`ProtectKernelModules=true`, `ProtectKernelLogs=true`,
+`ProtectControlGroups=true`, `RestrictNamespaces=true`, `LockPersonality=true`,
+and `RestrictSUIDSGID=true` are set on every unit.
+
 ---
 
 ## What you get

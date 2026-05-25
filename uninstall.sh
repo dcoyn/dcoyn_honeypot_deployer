@@ -70,10 +70,14 @@ for AGENT_NAME in "${TARGETS[@]}"; do
   rm -f "/etc/rsyslog.d/30-$AGENT_NAME.conf"
   systemctl restart rsyslog 2>/dev/null || true
 
-  # Remove user
-  if id "$AGENT_NAME" &>/dev/null; then
-    userdel "$AGENT_NAME" 2>/dev/null || true
-  fi
+  # Remove privsep accounts (current install creates -s/-c/-y users and a -rw group;
+  # older installs may have just $AGENT_NAME — clean both)
+  for u in "$AGENT_NAME-s" "$AGENT_NAME-c" "$AGENT_NAME-y" "$AGENT_NAME"; do
+    if id "$u" &>/dev/null; then
+      userdel "$u" 2>/dev/null || true
+    fi
+  done
+  getent group "$AGENT_NAME-rw" >/dev/null && groupdel "$AGENT_NAME-rw" 2>/dev/null || true
 
   # Remove on-disk artifacts (NOT the install log — keep that for forensics)
   rm -rf "/opt/$AGENT_NAME" \

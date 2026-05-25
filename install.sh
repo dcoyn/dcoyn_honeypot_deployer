@@ -82,19 +82,30 @@ INSTALL_FAILED=0
 
 on_error() {
   local lineno="$1" rc="$2" cmd="$3"
+  # First thing: disarm so any failing diagnostic command below can't re-enter
+  # this trap and produce a cascade of nested error messages.
+  trap '' ERR
+  set +eE
+  set +o pipefail
+
   INSTALL_FAILED=1
   err "--------------------------------------------------------------------"
   err "Install failed at line ${lineno}: '${cmd}' (exit ${rc})"
   err "Log file: ${INSTALL_LOG}"
-  err "Last 20 lines of output:"
-  tail -n 20 "$INSTALL_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
+  err "Last 15 lines of output:"
+  # All diagnostic commands are made bulletproof with || true so they can't
+  # cause more noise.
+  tail -n 15 "$INSTALL_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
   err "--------------------------------------------------------------------"
-  err "Re-run with set -x for verbose tracing, or inspect ${INSTALL_LOG}."
+  err "Re-run with bash -x for verbose tracing, or inspect ${INSTALL_LOG}."
   if (( ${#INSTALLED_UNITS[@]} > 0 )); then
     err "Partial install was performed. To clean up, run:"
-    err "  sudo bash ${INSTALL_LOG%/install*}/uninstall.sh $AGENT_NAME"
-    err "  (or manually stop: ${INSTALLED_UNITS[*]})"
+    err "  sudo bash uninstall.sh ${AGENT_NAME:-}"
   fi
+  # IMPORTANT: explicit exit so the script stops here. Without this, bash
+  # behavior with ERR traps + set -e is version-dependent and the script
+  # may keep going past the failure.
+  exit "${rc:-1}"
 }
 trap 'on_error "${LINENO}" "$?" "${BASH_COMMAND}"' ERR
 
@@ -546,22 +557,22 @@ if [[ ! -d "$AGENT_REPO_DIR/.git" ]]; then
     if sudo -u "$SYNC_USER" git -C "$AGENT_DATA" clone --quiet "$AUTH_REPO" store 2>/tmp/git-err; then
       break
     fi
-    warn "logs-repo clone failed (attempt $attempt/3): $(cat /tmp/git-err | head -1)"
+    warn "node-repo clone failed (attempt $attempt/3): $(head -1 /tmp/git-err 2>/dev/null || true)"
     rm -rf "$AGENT_REPO_DIR"
     sleep 3
     if (( attempt == 3 )); then
-      warn "Could not clone logs repo — initializing empty + adding remote (push will create branch on first sync)"
-      sudo -u "$AGENT_USER" mkdir -p "$AGENT_REPO_DIR"
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" init --quiet
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" remote add origin "$AUTH_REPO"
-      sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" checkout -b main 2>/dev/null || true
+      warn "Could not clone node repo — initializing empty + adding remote (push will create branch on first sync)"
+      sudo -u "$SYNC_USER" mkdir -p "$AGENT_REPO_DIR"
+      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" init --quiet
+      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" remote add origin "$AUTH_REPO"
+      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" checkout -b main 2>/dev/null || true
     fi
   done
 fi
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config user.email "agent@local"
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config user.name  "agent-bot"
-sudo -u "$AGENT_USER" git -C "$AGENT_REPO_DIR" config pull.rebase true
-ok "Logs repo at $AGENT_REPO_DIR"
+sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config user.email "agent@local"
+sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config user.name  "agent-bot"
+sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config pull.rebase true
+ok "Per-node repo at $AGENT_REPO_DIR"
 
 # -----------------------------------------------------------------------------
 # 16. Write config and env file

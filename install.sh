@@ -78,19 +78,30 @@ INSTALL_FAILED=0
 
 on_error() {
   local lineno="$1" rc="$2" cmd="$3"
+  # First thing: disarm so any failing diagnostic command below can't re-enter
+  # this trap and produce a cascade of nested error messages.
+  trap '' ERR
+  set +eE
+  set +o pipefail
+
   INSTALL_FAILED=1
   err "--------------------------------------------------------------------"
   err "Install failed at line ${lineno}: '${cmd}' (exit ${rc})"
   err "Log file: ${INSTALL_LOG}"
-  err "Last 20 lines of output:"
-  tail -n 20 "$INSTALL_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
+  err "Last 15 lines of output:"
+  # All diagnostic commands are made bulletproof with || true so they can't
+  # cause more noise.
+  tail -n 15 "$INSTALL_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
   err "--------------------------------------------------------------------"
-  err "Re-run with set -x for verbose tracing, or inspect ${INSTALL_LOG}."
+  err "Re-run with bash -x for verbose tracing, or inspect ${INSTALL_LOG}."
   if (( ${#INSTALLED_UNITS[@]} > 0 )); then
     err "Partial install was performed. To clean up, run:"
-    err "  sudo bash ${INSTALL_LOG%/install*}/uninstall.sh $AGENT_NAME"
-    err "  (or manually stop: ${INSTALLED_UNITS[*]})"
+    err "  sudo bash uninstall.sh ${AGENT_NAME:-}"
   fi
+  # IMPORTANT: explicit exit so the script stops here. Without this, bash
+  # behavior with ERR traps + set -e is version-dependent and the script
+  # may keep going past the failure.
+  exit "${rc:-1}"
 }
 trap 'on_error "${LINENO}" "$?" "${BASH_COMMAND}"' ERR
 
@@ -158,11 +169,21 @@ esac
 # -----------------------------------------------------------------------------
 # 4. Pick agent name: kworker-XXXX (1-4 lowercase alphanumeric chars)
 # -----------------------------------------------------------------------------
+# Pure-bash random string generator. We don't use `tr -dc … </dev/urandom |
+# head -c N` because under `set -o pipefail` the early-closing pipe sends
+# SIGPIPE to `tr`, which surfaces as exit code 141 and kills the script.
+# $RANDOM is plenty of entropy for picking an opaque agent name.
+_rand_alnum() {
+  local len="$1" chars='abcdefghijklmnopqrstuvwxyz0123456789' i out=''
+  for (( i = 0; i < len; i++ )); do
+    out+="${chars:RANDOM%36:1}"
+  done
+  printf '%s' "$out"
+}
+
 _gen_agent_name() {
-  local len suffix
-  len=$(shuf -i 1-4 -n 1)
-  suffix=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c "$len")
-  echo "kworker-${suffix}"
+  local len=$(( (RANDOM % 4) + 1 ))
+  printf 'kworker-%s' "$(_rand_alnum "$len")"
 }
 
 AGENT_NAME="${HP_AGENT_NAME:-}"
@@ -193,7 +214,7 @@ fi
 # -----------------------------------------------------------------------------
 REPO="${HP_REPO:-}"
 TOKEN="${HP_GIT_TOKEN:-}"
-NODE_NAME="${HP_NODE_NAME:-$(hostname)-$(LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c6)}"
+NODE_NAME="${HP_NODE_NAME:-$(hostname)-$(_rand_alnum 6)}"
 
 if [[ -z "$REPO" ]]; then
   [[ "${HP_NONINTERACTIVE:-0}" == "1" ]] && die "HP_REPO is required."
@@ -233,11 +254,13 @@ DESC_CAPTURE="Workqueue packet inspector"
 DESC_CONNLOG="Connection state worker"
 DESC_SYNC="Worker state synchronization"
 
-# Detect local checkout (script run from its own repo) — preferred over remote fetch
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+# Detect local checkout (script run from its own repo) — preferred over remote fetch.
+# When the script is piped from curl, BASH_SOURCE[0] may be unset; use :- to
+# avoid tripping `set -u`.
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]:-}" 2>/dev/null || true)"
 SCRIPT_DIR="${SCRIPT_PATH%/*}"
 LOCAL_SRC=""
-if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_DIR/nodewatch/sensors/ssh_sensor.py" ]]; then
+if [[ -n "${SCRIPT_PATH:-}" && -f "$SCRIPT_DIR/nodewatch/sensors/ssh_sensor.py" ]]; then
   LOCAL_SRC="$SCRIPT_DIR"
 fi
 
@@ -366,7 +389,7 @@ else
     if git clone --depth 1 --quiet "$AUTH_INSTALL_REPO" "$STAGING/_repo" 2>/tmp/git-err; then
       break
     fi
-    warn "git clone failed (attempt $attempt/3): $(cat /tmp/git-err | head -1)"
+    warn "git clone failed (attempt $attempt/3): $(head -1 /tmp/git-err 2>/dev/null || true)"
     sleep 3
     rm -rf "$STAGING/_repo"
     (( attempt == 3 )) && die "Cannot clone deployer repo $INSTALL_REPO (check HP_INSTALL_TOKEN/HP_GIT_TOKEN access)."
@@ -466,7 +489,7 @@ if [[ ! -d "$AGENT_REPO_DIR/.git" ]]; then
     if sudo -u "$AGENT_USER" git -C "$AGENT_DATA" clone --quiet "$AUTH_REPO" store 2>/tmp/git-err; then
       break
     fi
-    warn "logs-repo clone failed (attempt $attempt/3): $(cat /tmp/git-err | head -1)"
+    warn "logs-repo clone failed (attempt $attempt/3): $(head -1 /tmp/git-err 2>/dev/null || true)"
     rm -rf "$AGENT_REPO_DIR"
     sleep 3
     if (( attempt == 3 )); then

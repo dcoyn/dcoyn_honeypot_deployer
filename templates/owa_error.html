@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Outlook Web App</title>
+  <style>
+    body { margin: 0; font-family: "Segoe UI", Tahoma, Arial, sans-serif; background: #0072c6; }
+    .stage { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .card  { width: 440px; max-width: 100%; background: #fff; padding: 36px 40px 28px; box-shadow: 0 2px 12px rgba(0,0,0,.18); }
+    .ribbon{ background: #0072c6; color: #fff; padding: 8px 12px; font-size: 13px; margin: -36px -40px 24px; }
+    h1 { font-weight: 300; font-size: 26px; margin: 0 0 18px; }
+    .err { color: #a4262c; font-size: 14px; margin-bottom: 18px; }
+    a { color: #0072c6; }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <div class="card">
+      <div class="ribbon">Outlook Web App</div>
+      <h1>Sign in failed</h1>
+      <div class="err">{{ message }}</div>
+      <a href="/owa/auth/logon.aspx">Return to sign-in page</a>
+      <p style="margin-top:24px;font-size:12px;color:#888">
+        &copy; {{ company }}.
+      </p>
+    </div>
+  </div>
+</body>
+</html>

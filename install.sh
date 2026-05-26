@@ -454,12 +454,25 @@ SHARED_GROUP="$AGENT_NAME-rw"
 log "Creating privsep accounts and directories…"
 
 getent group  "$SHARED_GROUP"   >/dev/null || groupadd --system "$SHARED_GROUP"
+
+# Each user gets its own eponymous primary group (so we can chown root:$USER
+# in the steps below — important for token isolation), AND is also a member
+# of $SHARED_GROUP for cross-user log appends. `--user-group` (-U) forces
+# useradd to create the same-named group instead of using login.defs defaults.
 id            "$SENSOR_USER"    &>/dev/null || useradd --system --no-create-home \
-    --home "$AGENT_DATA" --shell /usr/sbin/nologin -g "$SHARED_GROUP" "$SENSOR_USER"
+    --home "$AGENT_DATA" --shell /usr/sbin/nologin --user-group "$SENSOR_USER"
 id            "$CONNLOG_USER"   &>/dev/null || useradd --system --no-create-home \
-    --home "$AGENT_DATA" --shell /usr/sbin/nologin -g "$SHARED_GROUP" "$CONNLOG_USER"
+    --home "$AGENT_DATA" --shell /usr/sbin/nologin --user-group "$CONNLOG_USER"
 id            "$SYNC_USER"      &>/dev/null || useradd --system --no-create-home \
-    --home "$AGENT_DATA" --shell /usr/sbin/nologin -g "$SHARED_GROUP" "$SYNC_USER"
+    --home "$AGENT_DATA" --shell /usr/sbin/nologin --user-group "$SYNC_USER"
+
+# Add each user to the shared group (supplementary). Also handles the case
+# where users were created by a previous, broken version of this script
+# with -g $SHARED_GROUP (no eponymous group): groupadd them now.
+for _u in "$SENSOR_USER" "$CONNLOG_USER" "$SYNC_USER"; do
+  getent group "$_u" >/dev/null || groupadd --system "$_u"
+  usermod -g "$_u" -aG "$SHARED_GROUP" "$_u"
+done
 
 # Add connlog user to 'adm' so it can read the rsyslog-written kernel log
 usermod -a -G adm "$CONNLOG_USER" 2>/dev/null || true
@@ -552,23 +565,33 @@ fi
 log "Cloning per-node repo $REPO…"
 AUTH_REPO=$(echo "$REPO" | sed "s|https://|https://x-access-token:${TOKEN}@|")
 if [[ ! -d "$AGENT_REPO_DIR/.git" ]]; then
+  # Clone as root: $AGENT_DATA is 0750 root-owned so the sync user can't
+  # mkdir inside it. We chown the result to the sync user afterwards. The
+  # cloned .git/config holds the auth URL (token-bearing) — the 0700 mode
+  # on the store dir combined with sync-user ownership keeps it private.
   rm -rf "$AGENT_REPO_DIR"
+  CLONED=0
   for attempt in 1 2 3; do
-    if sudo -u "$SYNC_USER" git -C "$AGENT_DATA" clone --quiet "$AUTH_REPO" store 2>/tmp/git-err; then
+    if git -C "$AGENT_DATA" clone --quiet "$AUTH_REPO" store 2>/tmp/git-err; then
+      CLONED=1
       break
     fi
     warn "node-repo clone failed (attempt $attempt/3): $(head -1 /tmp/git-err 2>/dev/null || true)"
     rm -rf "$AGENT_REPO_DIR"
     sleep 3
-    if (( attempt == 3 )); then
-      warn "Could not clone node repo — initializing empty + adding remote (push will create branch on first sync)"
-      sudo -u "$SYNC_USER" mkdir -p "$AGENT_REPO_DIR"
-      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" init --quiet
-      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" remote add origin "$AUTH_REPO"
-      sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" checkout -b main 2>/dev/null || true
-    fi
   done
+  if (( CLONED == 0 )); then
+    warn "Could not clone node repo — initializing empty + adding remote (push will create branch on first sync)"
+    mkdir -p "$AGENT_REPO_DIR"
+    git -C "$AGENT_REPO_DIR" init --quiet
+    git -C "$AGENT_REPO_DIR" remote add origin "$AUTH_REPO"
+    git -C "$AGENT_REPO_DIR" checkout -b main 2>/dev/null || true
+  fi
+  chown -R "$SYNC_USER:$SYNC_USER" "$AGENT_REPO_DIR"
+  chmod 0700 "$AGENT_REPO_DIR"
 fi
+
+# Configure git as the sync user (it's the only one that runs git going forward)
 sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config user.email "agent@local"
 sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config user.name  "agent-bot"
 sudo -u "$SYNC_USER" git -C "$AGENT_REPO_DIR" config pull.rebase true

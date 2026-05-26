@@ -601,6 +601,111 @@ PYEOF
 fi
 
 # -----------------------------------------------------------------------------
+# 14b. Download GeoLite2 MMDB databases (City + ASN) for per-event geo enrichment
+# -----------------------------------------------------------------------------
+# The sensor's enrichment module reads these at startup; if missing it falls
+# back to PTR-only. Files live at /var/lib/GeoIP/ (the standard Debian path),
+# and a weekly systemd timer refreshes them from the FyraLabs mirror.
+mkdir -p /var/lib/GeoIP
+chmod 0755 /var/lib/GeoIP
+
+GEOIP_BASE_URL="https://github.com/FyraLabs/geolite2/releases/latest/download"
+GEOIP_FALLBACK_URL="https://github.com/PrxyHunter/GeoLite2/releases/latest/download"
+
+download_mmdb() {
+  local name="$1"  # City or ASN
+  local dest="/var/lib/GeoIP/GeoLite2-${name}.mmdb"
+  local tmp="${dest}.tmp"
+  for base in "$GEOIP_BASE_URL" "$GEOIP_FALLBACK_URL"; do
+    local host=$(echo "$base" | awk -F/ '{print $3}')
+    log "  downloading GeoLite2-${name}.mmdb from $host…"
+    if curl -fsSL --max-time 300 -o "$tmp" "$base/GeoLite2-${name}.mmdb" 2>/dev/null; then
+      local sz=$(stat -c %s "$tmp" 2>/dev/null || echo 0)
+      if [ "$sz" -gt 1000000 ]; then
+        mv "$tmp" "$dest"
+        ok "    GeoLite2-${name}.mmdb ($((sz/1024/1024)) MB)"
+        return 0
+      else
+        warn "    file too small (${sz} bytes), trying next mirror"
+        rm -f "$tmp"
+      fi
+    fi
+  done
+  warn "    GeoLite2-${name}.mmdb unavailable; geo enrichment will degrade"
+  return 1
+}
+
+if [[ ! -f /var/lib/GeoIP/GeoLite2-City.mmdb ]]; then
+  log "Downloading GeoLite2 MMDB databases (~80 MB)…"
+  download_mmdb City || true
+  download_mmdb ASN  || true
+  chmod 0644 /var/lib/GeoIP/*.mmdb 2>/dev/null || true
+fi
+
+# Refresh script + weekly systemd timer
+cat > /usr/local/sbin/$AGENT_NAME-geoip-refresh.sh <<'REFRESH'
+#!/usr/bin/env bash
+# Re-download the GeoLite2 MMDB databases. Called by the weekly systemd timer.
+set -euo pipefail
+GEOIP_BASE_URL="https://github.com/FyraLabs/geolite2/releases/latest/download"
+GEOIP_FALLBACK_URL="https://github.com/PrxyHunter/GeoLite2/releases/latest/download"
+mkdir -p /var/lib/GeoIP
+for name in City ASN; do
+  dest="/var/lib/GeoIP/GeoLite2-${name}.mmdb"
+  tmp="${dest}.tmp"
+  ok=0
+  for base in "$GEOIP_BASE_URL" "$GEOIP_FALLBACK_URL"; do
+    if curl -fsSL --max-time 300 -o "$tmp" "$base/GeoLite2-${name}.mmdb"; then
+      sz=$(stat -c %s "$tmp" 2>/dev/null || echo 0)
+      if [ "$sz" -gt 1000000 ]; then
+        mv "$tmp" "$dest"
+        chmod 0644 "$dest"
+        ok=1
+        break
+      else
+        rm -f "$tmp"
+      fi
+    fi
+  done
+  if [ "$ok" -eq 0 ]; then
+    echo "WARNING: GeoLite2-${name}.mmdb refresh failed" >&2
+  fi
+done
+REFRESH
+chmod 0755 /usr/local/sbin/$AGENT_NAME-geoip-refresh.sh
+
+cat > /etc/systemd/system/$AGENT_NAME-geoip-refresh.service <<UNIT
+[Unit]
+Description=Refresh GeoLite2 MMDB databases for $AGENT_NAME
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/$AGENT_NAME-geoip-refresh.sh
+# Restart the sensor so it re-mmaps the new files
+ExecStartPost=/bin/systemctl try-restart $AGENT_NAME.service
+User=root
+UNIT
+
+cat > /etc/systemd/system/$AGENT_NAME-geoip-refresh.timer <<UNIT
+[Unit]
+Description=Weekly GeoLite2 MMDB refresh
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=4h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now $AGENT_NAME-geoip-refresh.timer >/dev/null
+ok "GeoIP refresh timer enabled (weekly, random delay up to 4h)"
+
+# -----------------------------------------------------------------------------
 # 15. Initialize logs repo (owned by sync-user — the only one who needs it)
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------

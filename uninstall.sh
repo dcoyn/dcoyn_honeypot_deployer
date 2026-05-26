@@ -59,12 +59,17 @@ for AGENT_NAME in "${TARGETS[@]}"; do
               "$AGENT_NAME-sync.service" \
               "$AGENT_NAME-connlog.service" \
               "$AGENT_NAME-capture.service" \
+              "$AGENT_NAME-geoip-refresh.timer" \
+              "$AGENT_NAME-geoip-refresh.service" \
               "$AGENT_NAME.service"; do
     systemctl stop    "$unit" 2>/dev/null || true
     systemctl disable "$unit" 2>/dev/null || true
     rm -f "/etc/systemd/system/$unit"
   done
   systemctl daemon-reload
+
+  # Remove the geoip refresh script (per-agent)
+  rm -f "/usr/local/sbin/$AGENT_NAME-geoip-refresh.sh"
 
   # Remove rsyslog filter
   rm -f "/etc/rsyslog.d/30-$AGENT_NAME.conf"

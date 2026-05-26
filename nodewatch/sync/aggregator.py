@@ -32,7 +32,7 @@ from typing import Iterable
 from ..config import Config
 
 
-STATE_FILE = "aggregator_state.json"
+STATE_FILE = ".git/hp-state.json"   # inside repo dir; git ignores .git/*
 RAW_EVENTS = "events.jsonl"
 
 
@@ -75,7 +75,7 @@ def run() -> dict:
     repo    = Path(cfg.repo_dir)
 
     events_path = log_dir / RAW_EVENTS
-    state_path  = Path(cfg.data_dir) / STATE_FILE
+    state_path  = Path(cfg.repo_dir) / STATE_FILE
     state       = _load_json(state_path, {"pos": 0})
     start_pos   = state.get("pos", 0)
 

@@ -927,18 +927,8 @@ class FakeFS:
             f"10.10.5.42 - - [25/May/2026:14:32:18 +0000] \"POST /api/payments/charge HTTP/1.1\" 200 47\n",
             owner="www-data", group="adm")
 
-        # /proc
-        add("/proc/cpuinfo",
-            "processor\t: 0\nvendor_id\t: GenuineIntel\n"
-            "model name\t: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n"
-            "cpu MHz\t\t: 2499.998\ncache size\t: 36608 KB\n\n"
-            "processor\t: 1\nvendor_id\t: GenuineIntel\n"
-            "model name\t: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n"
-            "cpu MHz\t\t: 2499.998\ncache size\t: 36608 KB\n")
-        add("/proc/meminfo",
-            "MemTotal:        4030788 kB\nMemFree:          312540 kB\n"
-            "MemAvailable:    1820432 kB\nBuffers:          120384 kB\n"
-            "Cached:          1342016 kB\n")
+        # /proc/version is the only static one — cpuinfo, meminfo, loadavg,
+        # uptime are rendered dynamically by FakeSystem.
         add("/proc/version",
             "Linux version 5.15.0-91-generic (buildd@lcy02-amd64-027) "
             "(gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0) #101-Ubuntu SMP\n")

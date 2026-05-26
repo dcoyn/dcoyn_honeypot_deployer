@@ -29,6 +29,7 @@ import socketserver
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,7 @@ from ..core.logger import EventType
 from ..core.enrichment import enrich
 from .fake_fs import FakeFS, DEFAULT_CANARY_BASE
 from .fake_world import FakeWorld
+from .fake_system import FakeSystem, render_proc_path
 
 # ----------------------------------------------------------------------------
 # Tunables
@@ -170,19 +172,17 @@ class _SensorServer(paramiko.ServerInterface):
 # so attackers see a consistent universe.
 # ----------------------------------------------------------------------------
 _FS: Optional[FakeFS] = None
+_SYS: Optional[FakeSystem] = None
 _FS_LOCK = threading.Lock()
 
 
 def _get_fs() -> FakeFS:
-    global _FS
+    global _FS, _SYS
     if _FS is None:
         with _FS_LOCK:
             if _FS is None:
                 cfg = Config.load()
                 agent = cfg.node_name or "kworker"
-                # Per-VM random universe. Generated once on first sensor start,
-                # then persisted so restarts see the same fake world. The file
-                # is sensor-user owned 0640 — root can read for debugging.
                 world_path = Path(cfg.data_dir) / "fake_world.json"
                 world = FakeWorld.load_or_create(agent, world_path)
                 _FS = FakeFS(
@@ -190,7 +190,14 @@ def _get_fs() -> FakeFS:
                     hostname=FAKE_HOSTNAME,
                     canary_base=os.environ.get("HP_CANARY_URL", DEFAULT_CANARY_BASE),
                 )
+                _SYS = FakeSystem(world=world, hostname=FAKE_HOSTNAME)
     return _FS
+
+
+def _get_sys() -> FakeSystem:
+    if _SYS is None:
+        _get_fs()  # forces init of both
+    return _SYS  # type: ignore[return-value]
 
 
 class _ShellState:
@@ -255,25 +262,20 @@ def _fake_ifconfig():
     )
 
 
-def _fake_ps():
-    return (
-        "  PID TTY          TIME CMD\n"
-        " 1234 pts/0    00:00:00 bash\n"
-        " 1289 pts/0    00:00:00 ps\n"
-        " 8421 ?        00:14:32 nginx\n"
-        " 8422 ?        00:14:31 nginx\n"
-        " 9012 ?        00:42:18 node\n"
-        " 9013 ?        00:42:17 node\n"
-        "12331 ?        00:08:44 postgres\n"
-    )
-
-
-def _fake_w():
-    return (
-        " 09:14:21 up 47 days, 12:03,  1 user,  load average: 0.04, 0.09, 0.06\n"
-        "USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT\n"
-        "ubuntu   pts/0    -                09:14    0.00s  0.01s  0.00s w\n"
-    )
+# These now delegate to FakeSystem for live, drifted output. Each call
+# returns slightly different CPU% / free memory / load avg so the
+# attacker sees a machine that's actually doing work.
+def _fake_ps():       return _get_sys().render_ps_aux()
+def _fake_ps_ef():    return _get_sys().render_ps_ef()
+def _fake_top():      return _get_sys().render_top()
+def _fake_w():        return _get_sys().render_w()
+def _fake_uptime():   return _get_sys().render_uptime()
+def _fake_free(**k):  return _get_sys().render_free(**k)
+def _fake_df(**k):    return _get_sys().render_df(**k)
+def _fake_vmstat():   return _get_sys().render_vmstat()
+def _fake_mpstat():   return _get_sys().render_mpstat()
+def _fake_nproc():    return _get_sys().render_nproc()
+def _fake_lscpu():    return _get_sys().render_lscpu()
 
 
 def _detect_filetype(data: bytes) -> str:
@@ -373,7 +375,7 @@ def _exec(state: _ShellState, cmd: str) -> str:
     if head == "hostname":
         return FAKE_HOSTNAME + "\n"
     if head == "uptime":
-        return " 09:14:21 up 47 days, 12:03,  1 user,  load average: 0.04, 0.09, 0.06\n"
+        return _fake_uptime()
     if head == "env" or head == "printenv":
         return "".join(f"{k}={v}\n" for k, v in state.env.items())
     if head == "echo":
@@ -492,9 +494,47 @@ def _exec(state: _ShellState, cmd: str) -> str:
 
     # --- process / sys info ---
     if head == "ps":
-        return _fake_ps()
+        # Recognize common ps flags. We render a big roster regardless;
+        # `ps` alone shows just this terminal's procs, `ps aux`/`ps -ef` show all.
+        joined = " ".join(rest) if rest else ""
+        if "-ef" in joined or joined == "-eaf":
+            return _fake_ps_ef()
+        if "aux" in joined or "-A" in joined or "-e" in joined or "ax" in joined:
+            return _fake_ps()
+        # Plain `ps` — only THIS shell's procs
+        return ("    PID TTY          TIME CMD\n"
+                f"{_get_sys()._procs[-2].pid:>7d} pts/0    00:00:00 bash\n"
+                f"{_get_sys()._procs[-2].pid + 4:>7d} pts/0    00:00:00 ps\n")
+    if head == "top":
+        return _fake_top()
+    if head == "htop":
+        # htop is curses — we can't render an interactive UI. Most attackers
+        # who try htop on a remote shell quickly switch to `top -bn1` anyway.
+        return ("Error opening terminal: unknown.\n"
+                "Trying to fall back to 'top'…\n"
+                + _fake_top())
+    if head == "vmstat":
+        return _fake_vmstat()
+    if head == "mpstat":
+        return _fake_mpstat()
+    if head == "iostat":
+        # Compact iostat-ish output
+        sys = _get_sys()
+        return (f"Linux 5.15.0-91-generic ({FAKE_HOSTNAME}) \t"
+                + datetime_now_str() + " \t_x86_64_\t"
+                + f"({sys.NUM_CPUS} CPU)\n\n"
+                "avg-cpu:  %user   %nice %system %iowait  %steal   %idle\n"
+                "          18.42    0.00    4.21    0.30    0.00   77.07\n\n"
+                "Device             tps    kB_read/s    kB_wrtn/s    kB_read    kB_wrtn\n"
+                "nvme0n1          12.34       142.21       287.43    1234567    9876543\n"
+                "nvme1n1          43.21       324.18       912.05    8765432   12345678\n"
+                "nvme2n1          78.43       512.34      1843.21   18765432   45678901\n")
+    if head == "nproc":
+        return _fake_nproc()
     if head == "w":
         return _fake_w()
+    if head == "uptime":
+        return _fake_uptime()
     if head == "who":
         return f"{state.username}  pts/0        " + time.strftime("%Y-%m-%d %H:%M") + " (10.0.0.1)\n"
     if head == "last":
@@ -505,26 +545,24 @@ def _exec(state: _ShellState, cmd: str) -> str:
     if head == "ifconfig" or (head == "ip" and "a" in (rest[0] if rest else "")):
         return _fake_ifconfig()
     if head == "df":
-        return (
-            "Filesystem     1K-blocks    Used Available Use% Mounted on\n"
-            "/dev/root       40197540 8194112  31987044  21% /\n"
-            "tmpfs            2015392       0   2015392   0% /dev/shm\n"
-            "/dev/sdb1      103079200 8421344  89481056   9% /var/backups\n"
-        )
+        return _fake_df(human=("h" in " ".join(rest)))
     if head == "free":
-        return (
-            "              total        used        free      shared  buff/cache   available\n"
-            "Mem:        4030788     2354128      312540        2068     1364120     1820432\n"
-            "Swap:             0           0           0\n"
-        )
+        joined = " ".join(rest)
+        if "-h" in joined:    return _fake_free(human=True)
+        if "-m" in joined:    return _fake_free(mb=True)
+        if "-g" in joined:    return _fake_free(gb=True)
+        return _fake_free()
     if head == "lscpu":
-        return ("Architecture:        x86_64\nCPU op-mode(s):      32-bit, 64-bit\n"
-                "Byte Order:          Little Endian\nCPU(s):              2\n"
-                "Vendor ID:           GenuineIntel\nModel name:          Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n")
+        return _fake_lscpu()
     if head == "mount":
-        return ("/dev/root on / type ext4 (rw,relatime)\n"
-                "tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev)\n"
-                "/dev/sdb1 on /var/backups type ext4 (rw,relatime)\n")
+        return ("/dev/nvme0n1p2 on / type ext4 (rw,relatime)\n"
+                "tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev,inode64)\n"
+                "tmpfs on /run type tmpfs (rw,nosuid,nodev,size=27307356k,nr_inodes=819200,mode=755,inode64)\n"
+                "/dev/nvme0n1p1 on /boot/efi type vfat (rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=ascii)\n"
+                "/dev/nvme1n1 on /var/lib/docker type ext4 (rw,relatime)\n"
+                "/dev/nvme2n1 on /var/lib/postgresql type ext4 (rw,relatime)\n"
+                "/dev/sdb1 on /var/backups type ext4 (rw,relatime)\n"
+                "/dev/sdc1 on /data type xfs (rw,relatime,attr2,inode64)\n")
 
     if head == "sudo":
         # Pretend we don't ask for password since "you're admin"
@@ -537,6 +575,10 @@ def _exec(state: _ShellState, cmd: str) -> str:
 
     # Fall through: behave like the command ran but produced nothing.
     return ""
+
+
+def datetime_now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%m/%d/%Y")
 
 
 def _do_ls(state, args) -> str:
@@ -597,6 +639,15 @@ def _do_cat(state, args) -> str:
     out = []
     for a in args:
         p = _resolve(state, a)
+
+        # Dynamic /proc/* paths (meminfo/loadavg/uptime/cpuinfo) are rendered
+        # fresh on every read so consecutive cats show different memory free,
+        # different load average, etc. — what attackers see on a live box.
+        proc_dyn = render_proc_path(_get_sys(), p)
+        if proc_dyn is not None:
+            out.append(proc_dyn.decode("utf-8"))
+            continue
+
         if not fs.exists(p):
             out.append(f"cat: {a}: No such file or directory\n")
             continue

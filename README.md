@@ -1,7 +1,7 @@
 # dcoyn_honeypot_deployer
 
-Debian honeypot agent. One VM runs one of three sensor profiles
-(`ssh`, `owa`, `winserver`), captures events to JSONL, and pushes them
+Debian honeypot agent. One VM runs one of four sensor profiles
+(`ssh`, `owa`, `winserver`, `fileshare`), captures events to JSONL, and pushes them
 every five minutes to a per-VM private GitHub repo via systemd timer.
 A separate central aggregator (in another repo) consolidates per-node
 repos and produces fleet-wide IOC feeds.
@@ -17,9 +17,10 @@ repos and produces fleet-wide IOC feeds.
 
 | `HP_TYPE`   | Ports                                       | Captures |
 |-------------|---------------------------------------------|----------|
-| `ssh`       | 22 (real sshd moves to 62222)               | SSH auth attempts, kex, exec/shell commands, file drops |
+| `ssh`       | 22 (real sshd moves to 62222)               | SSH auth attempts, kex, exec/shell commands, file drops, canary file exfil |
 | `owa`       | 80, 443 (self-signed TLS)                   | HTTP method/path/headers/body, login POSTs, scanner paths |
 | `winserver` | 135, 139, 445, 1433, 3389, 5985, 47001, 49152 | TCP payloads + plausible service banners (SMB2, MSSQL TDS, RDP X.224, WinRM) |
+| `fileshare` | 80, 443 (self-signed TLS)                   | HTTP request log + per-download canary tracking. Apache-autoindex-style open share with bait docs (`.env`, `.git/`, SQL dumps, credentials.txt, DOCX/XLSX/HTML canaries that beacon home when opened). |
 | `random`    | one of the above, picked at install         | — |
 
 On every profile: nftables connection log, JA3+JA4 fingerprinting via
@@ -104,11 +105,30 @@ real sshd to port 62222 for `ssh`/`random` profiles.
  unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
 ```
 
+### Fileshare
+
+```bash
+ unset HISTFILE; set +o history; \
+ read -rp "Node repo URL: " REPO; \
+ read -rsp "Token for that repo: " GH; echo; \
+ [ -n "$GH" ] && [ -n "$REPO" ] && \
+ export HP_GIT_TOKEN="$GH" \
+        HP_REPO="$REPO" \
+        HP_TYPE=fileshare \
+        HP_NODE_NAME="$(hostname)" \
+        HP_NONINTERACTIVE=1 && \
+ curl -fsSL \
+      https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh \
+   | sudo -E bash; \
+ unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+```
+
 ## Environment variables
 
 | Variable             | Default                          | Description |
 |----------------------|----------------------------------|-------------|
-| `HP_TYPE`            | (required)                       | `ssh` \| `owa` \| `winserver` \| `random` |
+| `HP_TYPE`            | (required)                       | `ssh` \| `owa` \| `winserver` \| `fileshare` \| `random` |
+| `HP_CANARY_URL`      | (empty)                          | Base URL embedded in canary docs (DOCX/XLSX/HTML). Beacon hits land here when an attacker opens an exfiltrated file. Operator-controlled; e.g. another OWA honeypot's URL, or a canarytokens.org token URL, or a dedicated webhook receiver. |
 | `HP_REPO`            | (required)                       | Per-VM logs repo URL (`https://github.com/<owner>/<repo>.git`) |
 | `HP_GIT_TOKEN`       | (required)                       | PAT for `HP_REPO`, `Contents: Read+write` |
 | `HP_AGENT_NAME`      | randomly generated               | Force a specific agent name. Must match `^kworker-[a-z0-9]{1,4}$` |

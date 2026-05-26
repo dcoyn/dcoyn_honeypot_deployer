@@ -148,26 +148,27 @@ ok "Pre-flight passed (kernel $(uname -r), ${RAM_MB}MB RAM, ${DISK_MB}MB disk)"
 # -----------------------------------------------------------------------------
 ARG_TYPE="${1:-${HP_TYPE:-}}"
 case "$ARG_TYPE" in
-  ssh|owa|winserver) ;;
+  ssh|owa|winserver|fileshare) ;;
   random)
-    ARG_TYPE=$(shuf -n1 -e ssh owa winserver)
+    ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare)
     log "Random profile selected: $ARG_TYPE"
     ;;
   "")
     if [[ "${HP_NONINTERACTIVE:-0}" == "1" ]]; then
       die "Sensor profile not given. Pass as arg, or set HP_TYPE."
     fi
-    echo "Sensor profile? [1] ssh  [2] owa  [3] winserver  [4] random"
+    echo "Sensor profile? [1] ssh  [2] owa  [3] winserver  [4] fileshare  [5] random"
     read -rp "> " choice
     case "$choice" in
       1) ARG_TYPE=ssh ;;
       2) ARG_TYPE=owa ;;
       3) ARG_TYPE=winserver ;;
-      4) ARG_TYPE=$(shuf -n1 -e ssh owa winserver) ;;
+      4) ARG_TYPE=fileshare ;;
+      5) ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare) ;;
       *) die "Invalid choice." ;;
     esac
     ;;
-  *) die "Unknown profile: '$ARG_TYPE' (use ssh|owa|winserver|random)" ;;
+  *) die "Unknown profile: '$ARG_TYPE' (use ssh|owa|winserver|fileshare|random)" ;;
 esac
 
 # -----------------------------------------------------------------------------
@@ -373,7 +374,8 @@ _apt_retry install -yqq \
   build-essential libssl-dev libffi-dev \
   git curl jq tcpdump openssh-server \
   nftables iptables rsyslog \
-  ca-certificates openssl
+  ca-certificates openssl \
+  wamerican
 
 ok "System packages installed"
 
@@ -412,6 +414,10 @@ fi
 # Sanity: required files present?
 for f in nodewatch/runner.py nodewatch/sensors/ssh_sensor.py \
          nodewatch/sensors/owa_sensor.py nodewatch/sensors/win_sensor.py \
+         nodewatch/sensors/fileshare_sensor.py \
+         nodewatch/sensors/fake_world.py nodewatch/sensors/fake_fs.py \
+         nodewatch/sensors/wordlists/firstnames.txt \
+         nodewatch/sensors/wordlists/lastnames.txt \
          templates/owa_login.html requirements.txt; do
   [[ -f "$STAGING/$f" ]] || die "Staged source missing $f"
 done
@@ -545,6 +551,20 @@ if [[ "$ARG_TYPE" == "owa" ]]; then
     chmod 0640 "$AGENT_DATA/owa.key"
     chmod 0644 "$AGENT_DATA/owa.crt"
     ok "OWA cert at $AGENT_DATA/owa.crt"
+  fi
+fi
+if [[ "$ARG_TYPE" == "fileshare" ]]; then
+  if [[ ! -f "$AGENT_DATA/share.crt" ]]; then
+    log "Generating self-signed cert for fileshare…"
+    # CN is generic since the share doesn't impersonate a real domain.
+    # The per-VM FakeWorld content (org name, etc.) is what gives it identity.
+    openssl req -x509 -nodes -newkey rsa:2048 \
+      -keyout "$AGENT_DATA/share.key" -out "$AGENT_DATA/share.crt" \
+      -days 730 -subj "/CN=files.local" 2>/dev/null
+    chown root:"$SENSOR_USER" "$AGENT_DATA/share.key" "$AGENT_DATA/share.crt"
+    chmod 0640 "$AGENT_DATA/share.key"
+    chmod 0644 "$AGENT_DATA/share.crt"
+    ok "Fileshare cert at $AGENT_DATA/share.crt"
   fi
 fi
 if [[ "$ARG_TYPE" == "ssh" ]]; then

@@ -19,8 +19,11 @@ admin:admin, etc.  Tune the list to whatever you want to attract.
 """
 from __future__ import annotations
 
+import base64 as _b64
 import io
 import os
+import re
+import shlex
 import socket
 import socketserver
 import threading
@@ -35,6 +38,8 @@ from ..config import Config
 from ..core import logger as L
 from ..core.logger import EventType
 from ..core.enrichment import enrich
+from .fake_fs import FakeFS, DEFAULT_CANARY_BASE
+from .fake_world import FakeWorld
 
 # ----------------------------------------------------------------------------
 # Tunables
@@ -160,37 +165,76 @@ class _SensorServer(paramiko.ServerInterface):
 # ----------------------------------------------------------------------------
 # Fake shell
 # ----------------------------------------------------------------------------
-_FAKE_FS = {
-    "/etc/passwd": (
-        "root:x:0:0:root:/root:/bin/bash\n"
-        "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
-        "bin:x:2:2:bin:/bin:/usr/sbin/nologin\n"
-        "sys:x:3:3:sys:/dev:/usr/sbin/nologin\n"
-        "sync:x:4:65534:sync:/bin:/bin/sync\n"
-        "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n"
-        "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"
-        "mysql:x:113:118:MySQL Server,,,:/nonexistent:/bin/false\n"
-    ),
-    "/etc/shadow": "cat: /etc/shadow: Permission denied\n",
-    "/etc/hostname": FAKE_HOSTNAME + "\n",
-    "/etc/os-release": (
-        'PRETTY_NAME="Ubuntu 22.04.4 LTS"\n'
-        'NAME="Ubuntu"\nVERSION_ID="22.04"\nVERSION="22.04.4 LTS (Jammy Jellyfish)"\n'
-        'VERSION_CODENAME=jammy\nID=ubuntu\nID_LIKE=debian\n'
-        'HOME_URL="https://www.ubuntu.com/"\nSUPPORT_URL="https://help.ubuntu.com/"\n'
-    ),
-    "/proc/cpuinfo": (
-        "processor\t: 0\nvendor_id\t: GenuineIntel\n"
-        "cpu family\t: 6\nmodel\t\t: 85\n"
-        "model name\t: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n"
-        "stepping\t: 7\ncpu MHz\t\t: 2499.998\ncache size\t: 36608 KB\n"
-    ),
-    "/proc/meminfo": (
-        "MemTotal:        4030788 kB\nMemFree:          312540 kB\n"
-        "MemAvailable:    1820432 kB\nBuffers:          120384 kB\n"
-        "Cached:          1342016 kB\nSwapCached:            0 kB\n"
-    ),
-}
+# ----------------------------------------------------------------------------
+# Per-VM fake filesystem singleton — same instance shared by all sessions
+# so attackers see a consistent universe.
+# ----------------------------------------------------------------------------
+_FS: Optional[FakeFS] = None
+_FS_LOCK = threading.Lock()
+
+
+def _get_fs() -> FakeFS:
+    global _FS
+    if _FS is None:
+        with _FS_LOCK:
+            if _FS is None:
+                cfg = Config.load()
+                agent = cfg.node_name or "kworker"
+                # Per-VM random universe. Generated once on first sensor start,
+                # then persisted so restarts see the same fake world. The file
+                # is sensor-user owned 0640 — root can read for debugging.
+                world_path = Path(cfg.data_dir) / "fake_world.json"
+                world = FakeWorld.load_or_create(agent, world_path)
+                _FS = FakeFS(
+                    world=world,
+                    hostname=FAKE_HOSTNAME,
+                    canary_base=os.environ.get("HP_CANARY_URL", DEFAULT_CANARY_BASE),
+                )
+    return _FS
+
+
+class _ShellState:
+    """Per-SSH-session shell state. Tracks cwd, env, command history."""
+    def __init__(self, username: str, session_id: str, src_ip: str, src_port: int):
+        self.username = username
+        self.session_id = session_id
+        self.src_ip = src_ip
+        self.src_port = src_port
+        # default cwd
+        self.cwd = f"/home/{username}" if username != "root" else "/root"
+        if not _get_fs().exists(self.cwd):
+            self.cwd = "/"
+        self.env = {
+            "HOME": self.cwd,
+            "USER": username,
+            "SHELL": "/bin/bash",
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "TERM": "xterm-256color",
+            "PWD":  self.cwd,
+        }
+
+
+def _resolve(state: _ShellState, arg: str) -> str:
+    """Resolve a shell path argument against state.cwd."""
+    if not arg:
+        return state.cwd
+    if arg == "~":
+        return state.env["HOME"]
+    if arg.startswith("~/"):
+        arg = state.env["HOME"] + arg[1:]
+    if not arg.startswith("/"):
+        arg = state.cwd.rstrip("/") + "/" + arg
+    # Normalize ./.. via the FS helper
+    return _get_fs()._norm(arg)
+
+
+def _format_ls_la_line(name: str, m) -> str:
+    """Render one `ls -l` line like real ls does."""
+    mtime = m.mtime.strftime("%b %d %H:%M")
+    size = f"{m.size:>8d}"
+    if m.is_link:
+        return f"{m.mode} {m.nlink} {m.owner:<8s} {m.group:<8s} {size} {mtime} {name} -> {m.link_target}"
+    return f"{m.mode} {m.nlink} {m.owner:<8s} {m.group:<8s} {size} {mtime} {name}"
 
 
 def _fake_uname():
@@ -198,7 +242,6 @@ def _fake_uname():
 
 
 def _fake_ifconfig():
-    # Return something that looks like a small cloud VM
     return (
         "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\n"
         "        inet 10.0.0.47  netmask 255.255.255.0  broadcast 10.0.0.255\n"
@@ -217,6 +260,11 @@ def _fake_ps():
         "  PID TTY          TIME CMD\n"
         " 1234 pts/0    00:00:00 bash\n"
         " 1289 pts/0    00:00:00 ps\n"
+        " 8421 ?        00:14:32 nginx\n"
+        " 8422 ?        00:14:31 nginx\n"
+        " 9012 ?        00:42:18 node\n"
+        " 9013 ?        00:42:17 node\n"
+        "12331 ?        00:08:44 postgres\n"
     )
 
 
@@ -228,62 +276,240 @@ def _fake_w():
     )
 
 
-def _exec_fake_command(cmd: str, username: str) -> str:
-    """Return stdout for the fake command. Bash-ish, intentionally limited."""
-    parts = cmd.strip().split()
+def _detect_filetype(data: bytes) -> str:
+    """Mimic the `file` command."""
+    if data.startswith(b"PK\x03\x04"):
+        # Check for ZIP-based office docs
+        if b"word/document.xml" in data[:4096]:
+            return "Microsoft Word 2007+ document"
+        if b"xl/workbook.xml" in data[:4096]:
+            return "Microsoft Excel 2007+ spreadsheet"
+        if b"ppt/presentation.xml" in data[:4096]:
+            return "Microsoft PowerPoint 2007+ presentation"
+        return "Zip archive data, at least v2.0 to extract"
+    if data.startswith(b"\x1f\x8b"):
+        return "gzip compressed data"
+    if data.startswith(b"\x7fELF"):
+        return "ELF 64-bit LSB executable, x86-64, dynamically linked"
+    if data.startswith(b"#!/"):
+        first_line = data.split(b"\n", 1)[0].decode("utf-8", "replace")
+        return f"a {first_line[2:]} script, ASCII text executable"
+    if data.startswith(b"%PDF"):
+        return "PDF document"
+    try:
+        data.decode("utf-8")
+        return "ASCII text" if all(b < 128 for b in data[:1024]) else "UTF-8 Unicode text"
+    except UnicodeDecodeError:
+        return "data"
+
+
+# ----------------------------------------------------------------------------
+# Main command dispatcher
+# ----------------------------------------------------------------------------
+_CANARY_URL_RE = re.compile(r"https?://[^\s'\"]+")
+
+
+def _emit_canary_event(state: _ShellState, kind: str, **extra) -> None:
+    """Log when an attacker interacts with a canary URL or file."""
+    L.get().emit(
+        EventType.SSH_COMMAND,
+        src_ip=state.src_ip, src_port=state.src_port, dst_port=LISTEN_PORT,
+        session_id=state.session_id,
+        data={"canary_event": kind, **extra},
+    )
+
+
+def _exec(state: _ShellState, cmd: str) -> str:
+    """Run a fake command, return stdout (or '__EXIT__')."""
+    cmd = cmd.strip()
+    if not cmd:
+        return ""
+
+    # Sniff for compound commands (we don't actually parse pipes; just
+    # handle some common patterns)
+    if "|" in cmd or ">" in cmd:
+        # Handle common single-pipe exfil patterns:
+        #   cat file | base64
+        #   base64 file | head -c N
+        m = re.match(r"^cat\s+(\S+)\s*\|\s*base64\s*$", cmd)
+        if m:
+            return _do_base64(state, m.group(1))
+        m = re.match(r"^base64\s+(\S+)\s*\|\s*head", cmd)
+        if m:
+            return _do_base64(state, m.group(1))[:1024] + "\n"
+        # Anything else with pipes/redirects: pretend it ran
+        return ""
+
+    try:
+        parts = shlex.split(cmd, posix=True)
+    except ValueError:
+        parts = cmd.split()
     if not parts:
         return ""
-    head = parts[0]
-    rest = parts[1:]
+    head, rest = parts[0], parts[1:]
 
+    fs = _get_fs()
+
+    # --- session control ---
     if head in ("exit", "logout", "quit"):
         return "__EXIT__"
+    if head == "clear":
+        return "\033[H\033[2J"
 
+    # --- env / identity ---
     if head == "whoami":
-        return username + "\n"
+        return state.username + "\n"
     if head == "id":
-        if username == "root":
+        if state.username == "root":
             return "uid=0(root) gid=0(root) groups=0(root)\n"
-        return f"uid=1000({username}) gid=1000({username}) groups=1000({username})\n"
+        uid = 1000 if state.username == "ubuntu" else 1001
+        return f"uid={uid}({state.username}) gid={uid}({state.username}) groups={uid}({state.username}),27(sudo),998(docker)\n"
     if head == "uname":
         if "-a" in rest:
             return _fake_uname()
+        if "-r" in rest:
+            return "5.15.0-91-generic\n"
         return "Linux\n"
     if head == "hostname":
         return FAKE_HOSTNAME + "\n"
-    if head == "pwd":
-        return f"/home/{username}\n" if username != "root" else "/root\n"
     if head == "uptime":
         return " 09:14:21 up 47 days, 12:03,  1 user,  load average: 0.04, 0.09, 0.06\n"
+    if head == "env" or head == "printenv":
+        return "".join(f"{k}={v}\n" for k, v in state.env.items())
+    if head == "echo":
+        return " ".join(rest) + "\n"
+    if head == "history":
+        return ""
+    if head == "date":
+        return time.strftime("%a %b %d %H:%M:%S UTC %Y", time.gmtime()) + "\n"
+    if head == "which":
+        if rest:
+            return f"/usr/bin/{rest[0]}\n"
+        return ""
+    if head == "groups":
+        if state.username == "root":
+            return "root\n"
+        return f"{state.username} sudo docker\n"
+
+    # --- navigation ---
+    if head == "pwd":
+        return state.cwd + "\n"
+    if head == "cd":
+        target = _resolve(state, rest[0] if rest else "~")
+        if not fs.exists(target):
+            return f"-bash: cd: {rest[0] if rest else target}: No such file or directory\n"
+        if not fs.is_dir(target):
+            return f"-bash: cd: {rest[0] if rest else target}: Not a directory\n"
+        state.cwd = target
+        state.env["PWD"] = target
+        return ""
+
+    # --- ls ---
+    if head == "ls":
+        return _do_ls(state, rest)
+
+    # --- cat / head / tail ---
+    if head == "cat":
+        return _do_cat(state, rest)
+    if head == "head":
+        return _do_head_tail(state, rest, head=True)
+    if head == "tail":
+        return _do_head_tail(state, rest, head=False)
+    if head == "less" or head == "more":
+        # No paginator — just dump
+        return _do_cat(state, rest)
+
+    # --- file inspection ---
+    if head == "file":
+        return _do_file(state, rest)
+    if head == "stat":
+        return _do_stat(state, rest)
+
+    # --- search ---
+    if head == "find":
+        return _do_find(state, rest)
+    if head == "grep":
+        return _do_grep(state, rest)
+
+    # --- exfil-friendly ---
+    if head == "base64":
+        if not rest:
+            return ""
+        # Handle "base64 -d" decode mode — pretend not implemented
+        if rest[0] in ("-d", "--decode"):
+            return "base64: invalid input\n"
+        return _do_base64(state, rest[0])
+
+    if head in ("md5sum", "sha256sum", "sha1sum"):
+        # Compute a real hash of the fake file's content
+        if not rest:
+            return ""
+        target = _resolve(state, rest[0])
+        try:
+            data = fs.read(target, session_id=state.session_id)
+        except FileNotFoundError:
+            return f"{head}: {rest[0]}: No such file or directory\n"
+        import hashlib as _h
+        algo = {"md5sum": "md5", "sha1sum": "sha1", "sha256sum": "sha256"}[head]
+        digest = getattr(_h, algo)(data).hexdigest()
+        return f"{digest}  {target}\n"
+
+    # --- network commands — log if attacker is hitting a canary URL ---
+    if head in ("wget", "curl"):
+        # Find the URL among rest
+        url = next((a for a in rest if a.startswith("http://") or a.startswith("https://")), None)
+        if url:
+            # Check if it's one of our canary URLs (they read it from a file
+            # and are now fetching it from the honeypot — strong signal)
+            if fs.canary_base and url.startswith(fs.canary_base):
+                _emit_canary_event(state, "canary_url_fetched_in_shell",
+                                   tool=head, url=url)
+            else:
+                # Any wget/curl is worth surfacing for IOC purposes
+                _emit_canary_event(state, "outbound_http_attempt",
+                                   tool=head, url=url)
+        if head == "wget":
+            fname = url.rsplit("/", 1)[-1] if url else "index.html"
+            return (f"--{time.strftime('%Y-%m-%d %H:%M:%S')}--  {url or ''}\n"
+                    f"Resolving... done.\n"
+                    f"Connecting... connected.\n"
+                    f"HTTP request sent, awaiting response... 200 OK\n"
+                    f"Length: 14392 (14K) [application/octet-stream]\n"
+                    f"Saving to: '{fname}'\n\n"
+                    f"     0K .......... ....                  100%  4.21M=0.003s\n\n"
+                    f"'{fname}' saved [14392/14392]\n")
+        else:
+            return ""  # curl silent on success by default
+
+    if head == "scp":
+        _emit_canary_event(state, "scp_invoked", args=rest)
+        return ""
+    if head == "ssh":
+        # Attacker pivoting — log the target
+        target = next((a for a in rest if "@" in a or "." in a), None)
+        _emit_canary_event(state, "ssh_pivot_attempt", target=target, args=rest)
+        return f"ssh: connect to host {target or 'unknown'} port 22: Connection timed out\n"
+
+    # --- process / sys info ---
     if head == "ps":
         return _fake_ps()
     if head == "w":
         return _fake_w()
-    if head in ("ifconfig", "ip"):
+    if head == "who":
+        return f"{state.username}  pts/0        " + time.strftime("%Y-%m-%d %H:%M") + " (10.0.0.1)\n"
+    if head == "last":
+        return ("ops      pts/1        10.10.5.42       Tue May 25 14:22   still logged in\n"
+                "deploy   pts/0        10.10.5.42       Tue May 25 09:14 - 11:48  (02:34)\n"
+                "admin    pts/0        10.10.5.42       Mon May 24 16:08 - 18:12  (02:04)\n"
+                "\nwtmp begins Sat Jan  1 00:00:01 2024\n")
+    if head == "ifconfig" or (head == "ip" and "a" in (rest[0] if rest else "")):
         return _fake_ifconfig()
-    if head == "cat" and rest:
-        out = []
-        for f in rest:
-            if f in _FAKE_FS:
-                out.append(_FAKE_FS[f])
-            else:
-                out.append(f"cat: {f}: No such file or directory\n")
-        return "".join(out)
-    if head == "ls":
-        # Pretend home dir
-        return ".bashrc\n.profile\n.ssh\n"
-    if head == "echo":
-        return " ".join(rest) + "\n"
-    if head in ("wget", "curl"):
-        # Pretend we're downloading. Many bots check $? — return success.
-        return f"{head}: pretending to fetch {' '.join(rest)}\n"
-    if head == "history":
-        return ""
     if head == "df":
         return (
             "Filesystem     1K-blocks    Used Available Use% Mounted on\n"
             "/dev/root       40197540 8194112  31987044  21% /\n"
             "tmpfs            2015392       0   2015392   0% /dev/shm\n"
+            "/dev/sdb1      103079200 8421344  89481056   9% /var/backups\n"
         )
     if head == "free":
         return (
@@ -291,14 +517,303 @@ def _exec_fake_command(cmd: str, username: str) -> str:
             "Mem:        4030788     2354128      312540        2068     1364120     1820432\n"
             "Swap:             0           0           0\n"
         )
-    if head == "which":
-        if rest:
-            return f"/usr/bin/{rest[0]}\n"
-        return ""
+    if head == "lscpu":
+        return ("Architecture:        x86_64\nCPU op-mode(s):      32-bit, 64-bit\n"
+                "Byte Order:          Little Endian\nCPU(s):              2\n"
+                "Vendor ID:           GenuineIntel\nModel name:          Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz\n")
+    if head == "mount":
+        return ("/dev/root on / type ext4 (rw,relatime)\n"
+                "tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev)\n"
+                "/dev/sdb1 on /var/backups type ext4 (rw,relatime)\n")
 
-    # Fall through: pretend it ran but produced nothing.
-    # Many recon scripts just check exit code, so producing empty output is fine.
+    if head == "sudo":
+        # Pretend we don't ask for password since "you're admin"
+        if rest:
+            return _exec(state, " ".join(rest))
+        return "sudo: a command is required\n"
+
+    if head == "su":
+        return ""  # silently do nothing
+
+    # Fall through: behave like the command ran but produced nothing.
     return ""
+
+
+def _do_ls(state, args) -> str:
+    fs = _get_fs()
+    long = False
+    show_hidden = False
+    targets = []
+    for a in args:
+        if a.startswith("-"):
+            if "l" in a: long = True
+            if "a" in a: show_hidden = True
+            if "h" in a: pass
+        else:
+            targets.append(a)
+    if not targets:
+        targets = [state.cwd]
+
+    out_lines = []
+    for t in targets:
+        p = _resolve(state, t)
+        if not fs.exists(p):
+            out_lines.append(f"ls: cannot access '{t}': No such file or directory")
+            continue
+        if fs.is_file(p):
+            if long:
+                m = fs.meta(p)
+                out_lines.append(_format_ls_la_line(p.split("/")[-1], m))
+            else:
+                out_lines.append(p.split("/")[-1])
+            continue
+        # directory
+        if len(targets) > 1:
+            out_lines.append(f"{p}:")
+        try:
+            entries = fs.list_dir(p)
+        except NotADirectoryError:
+            continue
+        if not show_hidden:
+            entries = [e for e in entries if not e[0].startswith(".")]
+        if long:
+            total = sum(e[1].size for e in entries) // 1024 + 4
+            out_lines.append(f"total {total}")
+            for name, m in entries:
+                out_lines.append(_format_ls_la_line(name, m))
+        else:
+            # Plain listing: just names, one per line is simplest and matches
+            # ls behavior on a non-tty.
+            for name, m in entries:
+                suffix = "/" if m.is_dir else ""
+                out_lines.append(name + suffix)
+    return "\n".join(out_lines) + ("\n" if out_lines else "")
+
+
+def _do_cat(state, args) -> str:
+    fs = _get_fs()
+    if not args:
+        return ""
+    out = []
+    for a in args:
+        p = _resolve(state, a)
+        if not fs.exists(p):
+            out.append(f"cat: {a}: No such file or directory\n")
+            continue
+        if fs.is_dir(p):
+            out.append(f"cat: {a}: Is a directory\n")
+            continue
+        m = fs.meta(p)
+        # Permission check
+        if "rw-------" in m.mode and m.owner != state.username and state.username != "root":
+            out.append(f"cat: {a}: Permission denied\n")
+            continue
+        if a.endswith("shadow") or p == "/etc/shadow":
+            if state.username != "root":
+                out.append(f"cat: {a}: Permission denied\n")
+                continue
+        if fs.is_canary(p):
+            # Log the canary read — attacker has the doc in front of them now
+            _emit_canary_event(state, "canary_file_read_via_cat",
+                               file=p, viewer="cat")
+            data = fs.read(p, session_id=state.session_id)
+            # Don't dump binary to terminal (it would break it), warn instead
+            out.append(f"cat: {a}: binary data, use `base64 {a}` to extract or scp\n")
+            continue
+        try:
+            data = fs.read(p, session_id=state.session_id)
+        except FileNotFoundError:
+            out.append(f"cat: {a}: No such file or directory\n")
+            continue
+        try:
+            out.append(data.decode("utf-8"))
+        except UnicodeDecodeError:
+            # Binary file
+            out.append(f"cat: {a}: binary data, use `base64 {a}` to extract\n")
+    return "".join(out)
+
+
+def _do_head_tail(state, args, head=True) -> str:
+    fs = _get_fs()
+    n = 10
+    files = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-n" and i + 1 < len(args):
+            try: n = int(args[i + 1])
+            except ValueError: pass
+            i += 2; continue
+        if a.startswith("-") and a[1:].isdigit():
+            n = int(a[1:]); i += 1; continue
+        files.append(a); i += 1
+    if not files:
+        return ""
+    out = []
+    for f in files:
+        p = _resolve(state, f)
+        try:
+            data = fs.read(p, session_id=state.session_id).decode("utf-8", "replace")
+        except FileNotFoundError:
+            out.append(f"{'head' if head else 'tail'}: cannot open '{f}' for reading: No such file or directory\n")
+            continue
+        lines = data.splitlines(keepends=True)
+        sel = lines[:n] if head else lines[-n:]
+        out.append("".join(sel))
+    return "".join(out)
+
+
+def _do_file(state, args) -> str:
+    fs = _get_fs()
+    out = []
+    for a in args:
+        p = _resolve(state, a)
+        if not fs.exists(p):
+            out.append(f"{a}: cannot open `{a}' (No such file or directory)\n")
+            continue
+        if fs.is_dir(p):
+            out.append(f"{a}: directory\n")
+            continue
+        try:
+            data = fs.read(p, session_id=state.session_id, max_bytes=4096)
+            out.append(f"{a}: {_detect_filetype(data)}\n")
+        except FileNotFoundError:
+            out.append(f"{a}: cannot open\n")
+    return "".join(out)
+
+
+def _do_stat(state, args) -> str:
+    fs = _get_fs()
+    if not args:
+        return ""
+    p = _resolve(state, args[0])
+    if not fs.exists(p):
+        return f"stat: cannot stat '{args[0]}': No such file or directory\n"
+    m = fs.meta(p)
+    kind = "directory" if m.is_dir else "regular file"
+    mtime = m.mtime.strftime("%Y-%m-%d %H:%M:%S.000000000 +0000")
+    return (f"  File: {p}\n"
+            f"  Size: {m.size:<10d} Blocks: {(m.size + 511) // 512:<10d} IO Block: 4096   {kind}\n"
+            f"Device: 801h/2049d Inode: {abs(hash(p)) % 9999999:<10d} Links: {m.nlink}\n"
+            f"Access: ({m.mode[1:].replace('-', '').count('r') * 4:0>3d}/{m.mode}) Uid: ({m.owner})  Gid: ({m.group})\n"
+            f"Access: {mtime}\nModify: {mtime}\nChange: {mtime}\n")
+
+
+def _do_find(state, args) -> str:
+    """Very basic find. Supports: find [path] [-name PATTERN] [-type f|d]"""
+    fs = _get_fs()
+    root = state.cwd
+    name_pat = None
+    type_filter = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-name" and i + 1 < len(args):
+            name_pat = args[i + 1]; i += 2; continue
+        if a == "-type" and i + 1 < len(args):
+            type_filter = args[i + 1]; i += 2; continue
+        if not a.startswith("-"):
+            root = _resolve(state, a); i += 1; continue
+        i += 1
+
+    if not fs.exists(root):
+        return f"find: '{root}': No such file or directory\n"
+
+    out = []
+    import fnmatch
+    for path in fs.all_paths():
+        if not (path == root or path.startswith(root.rstrip("/") + "/")):
+            continue
+        m = fs.meta(path)
+        if type_filter == "f" and m.is_dir: continue
+        if type_filter == "d" and not m.is_dir: continue
+        if name_pat:
+            base = path.rsplit("/", 1)[-1]
+            if not fnmatch.fnmatch(base, name_pat):
+                continue
+        out.append(path)
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def _do_grep(state, args) -> str:
+    """Basic grep. Supports: grep [-r] [-i] [-l] [-n] PATTERN PATH..."""
+    fs = _get_fs()
+    recursive = False
+    ignore_case = False
+    list_files = False
+    show_lineno = False
+    positional = []
+    for a in args:
+        if a.startswith("-"):
+            if "r" in a or "R" in a: recursive = True
+            if "i" in a: ignore_case = True
+            if "l" in a: list_files = True
+            if "n" in a: show_lineno = True
+        else:
+            positional.append(a)
+    if len(positional) < 2:
+        return "Usage: grep [-r] [-i] [-l] [-n] PATTERN PATH\n"
+    pattern, *paths = positional
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        pat = re.compile(pattern, flags)
+    except re.error:
+        pat = re.compile(re.escape(pattern), flags)
+
+    targets: list[str] = []
+    for p in paths:
+        rp = _resolve(state, p)
+        if not fs.exists(rp):
+            continue
+        if fs.is_file(rp):
+            targets.append(rp)
+        elif recursive:
+            for ap in fs.all_paths():
+                if ap.startswith(rp.rstrip("/") + "/") and fs.is_file(ap):
+                    targets.append(ap)
+
+    out = []
+    for t in targets:
+        try:
+            data = fs.read(t, session_id=state.session_id).decode("utf-8", "replace")
+        except FileNotFoundError:
+            continue
+        for ln, line in enumerate(data.splitlines(), 1):
+            if pat.search(line):
+                if list_files:
+                    out.append(t)
+                    break
+                if show_lineno:
+                    if len(targets) > 1:
+                        out.append(f"{t}:{ln}:{line}")
+                    else:
+                        out.append(f"{ln}:{line}")
+                else:
+                    if len(targets) > 1:
+                        out.append(f"{t}:{line}")
+                    else:
+                        out.append(line)
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def _do_base64(state, arg) -> str:
+    fs = _get_fs()
+    p = _resolve(state, arg)
+    if not fs.exists(p):
+        return f"base64: {arg}: No such file or directory\n"
+    if fs.is_dir(p):
+        return f"base64: {arg}: Is a directory\n"
+    try:
+        data = fs.read(p, session_id=state.session_id)
+    except FileNotFoundError:
+        return f"base64: {arg}: No such file or directory\n"
+    if fs.is_canary(p):
+        # Attacker just exfil'd a canary doc
+        _emit_canary_event(state, "canary_file_exfiltrated_via_base64",
+                            file=p, bytes=len(data))
+    # Wrap at 76 cols like real base64
+    encoded = _b64.b64encode(data).decode("ascii")
+    return "\n".join(encoded[i:i + 76] for i in range(0, len(encoded), 76)) + "\n"
 
 
 # ----------------------------------------------------------------------------
@@ -398,10 +913,12 @@ class _Handler(socketserver.BaseRequestHandler):
     # ----------------------------------------------------------- fake shell
     def _serve_shell(self, chan, server):
         username = server.username or "user"
+        state = _ShellState(username, server.session_id, server.src_ip, server.src_port)
+
         # One-shot exec mode (paramiko opens a new channel per exec_command)
         exec_cmd = server.take_exec(chan)
         if exec_cmd is not None:
-            out = _exec_fake_command(exec_cmd, username)
+            out = _exec(state, exec_cmd)
             if out == "__EXIT__":
                 out = ""
             try: chan.send(out)
@@ -410,13 +927,22 @@ class _Handler(socketserver.BaseRequestHandler):
             except Exception: pass
             return
 
-        prompt = f"{username}@{FAKE_HOSTNAME}:~$ " if username != "root" else f"root@{FAKE_HOSTNAME}:~# "
+        def _prompt():
+            short_cwd = state.cwd
+            home = state.env["HOME"]
+            if short_cwd == home:
+                short_cwd = "~"
+            elif short_cwd.startswith(home + "/"):
+                short_cwd = "~" + short_cwd[len(home):]
+            sym = "#" if username == "root" else "$"
+            return f"{username}@{FAKE_HOSTNAME}:{short_cwd}{sym} "
+
         chan.send(f"Welcome to Ubuntu 22.04.4 LTS (GNU/Linux 5.15.0-91-generic x86_64)\r\n\r\n")
         chan.send(" * Documentation:  https://help.ubuntu.com\r\n")
         chan.send(" * Management:     https://landscape.canonical.com\r\n")
         chan.send(" * Support:        https://ubuntu.com/advantage\r\n\r\n")
-        chan.send(f"Last login: {time.strftime('%a %b %d %H:%M:%S %Y')} from 10.0.0.1\r\n")
-        chan.send(prompt)
+        chan.send(f"Last login: {time.strftime('%a %b %d %H:%M:%S %Y')} from 10.10.5.42\r\n")
+        chan.send(_prompt())
 
         buf = bytearray()
         cmd_count = 0
@@ -431,9 +957,6 @@ class _Handler(socketserver.BaseRequestHandler):
 
             for b in data:
                 ch = bytes([b])
-                # Treat CR, LF, or CRLF as a line terminator. Real terminals
-                # send CR (ENTER from a PTY); programmatic clients often send
-                # LF. Coalesce CRLF so we don't double-fire.
                 if ch == b"\r" or ch == b"\n":
                     if ch == b"\n" and last_was_cr:
                         last_was_cr = False
@@ -447,9 +970,10 @@ class _Handler(socketserver.BaseRequestHandler):
                         EventType.SSH_COMMAND,
                         src_ip=server.src_ip, src_port=server.src_port, dst_port=LISTEN_PORT,
                         session_id=server.session_id,
-                        data={"command": cmd, "mode": "shell", "seq": cmd_count},
+                        data={"command": cmd, "mode": "shell", "seq": cmd_count,
+                              "cwd": state.cwd},
                     )
-                    out = _exec_fake_command(cmd, username)
+                    out = _exec(state, cmd)
                     if out == "__EXIT__":
                         chan.send("logout\r\n")
                         L.get().emit(
@@ -462,7 +986,7 @@ class _Handler(socketserver.BaseRequestHandler):
                         return
                     if out:
                         chan.send(out.replace("\n", "\r\n"))
-                    chan.send(prompt)
+                    chan.send(_prompt())
                     continue
                 else:
                     last_was_cr = False
@@ -473,7 +997,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 elif ch == b"\x03":  # ctrl-c
                     chan.send(b"^C\r\n")
                     buf.clear()
-                    chan.send(prompt)
+                    chan.send(_prompt())
                 elif ch == b"\x04":  # ctrl-d
                     if not buf:
                         chan.send("logout\r\n")

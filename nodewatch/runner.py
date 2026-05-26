@@ -25,6 +25,9 @@ def main() -> int:
     elif t == "winserver":
         from .sensors import win_sensor
         win_sensor.serve()
+    elif t == "fileshare":
+        from .sensors import fileshare_sensor
+        fileshare_sensor.serve()
     else:
         print(f"unknown sensor_profile: {t}", file=sys.stderr)
         return 2

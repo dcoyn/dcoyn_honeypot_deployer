@@ -73,8 +73,8 @@ fi
 GIT_CONFIG="/var/lib/$AGENT_NAME/store/.git/config"
 [[ -f $GIT_CONFIG ]] || die "Logs repo not at $GIT_CONFIG — can't extract token."
 
-AUTH_URL=$(awk '/\[remote "origin"\]/,/^$|^\[/' "$GIT_CONFIG" \
-           | awk -F' = ' '/^[[:space:]]*url/{print $2; exit}')
+AUTH_URL=$(sed -nE 's|^[[:space:]]*url[[:space:]]*=[[:space:]]*(https://[^[:space:]]+)$|\1|p' \
+           "$GIT_CONFIG" | head -1)
 [[ -n $AUTH_URL ]] || die "Cannot parse remote URL from $GIT_CONFIG"
 
 if [[ $AUTH_URL =~ ^https://x-access-token:([^@]+)@(.+)$ ]]; then

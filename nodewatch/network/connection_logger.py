@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -62,10 +63,20 @@ def _parse(line: str, prefix: str) -> dict | None:
 
 
 def _tail(path: str):
-    """Generator that yields new lines as they appear (with rotation handling)."""
+    """Generator that yields new lines as they appear (with rotation handling).
+    Read-only: this process doesn't have write perms on the rsyslog-written
+    file. Wait politely if it doesn't exist yet (rsyslog creates it on first
+    matching packet)."""
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.touch(exist_ok=True)
+    waited = 0
+    while not p.exists():
+        if waited == 0:
+            sys.stderr.write(f"connlog: waiting for {path} to appear…\n")
+            sys.stderr.flush()
+        time.sleep(2)
+        waited += 2
+        # Don't print again, but keep waiting forever — rsyslog will create
+        # the file as soon as the first matching connection arrives.
     fh = open(p, "r", encoding="utf-8", errors="replace")
     fh.seek(0, 2)  # end
     inode = p.stat().st_ino

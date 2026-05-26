@@ -328,7 +328,9 @@ EOF
 # -----------------------------------------------------------------------------
 # 9. Move real sshd to admin port BEFORE installing SSH sensor
 # -----------------------------------------------------------------------------
-if [[ "$ARG_TYPE" == "ssh" ]]; then
+# Profiles that bind port 22 (the SSH sensor): "ssh" and "fileshare".
+# Fileshare is a Linux box that, for credibility, also exposes the SSH sensor.
+if [[ "$ARG_TYPE" == "ssh" || "$ARG_TYPE" == "fileshare" ]]; then
   log "Moving real sshd to port $ADMIN_SSH_PORT…"
   if ! grep -qE "^Port\s+$ADMIN_SSH_PORT" /etc/ssh/sshd_config; then
     cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$INSTALL_TS"
@@ -567,7 +569,7 @@ if [[ "$ARG_TYPE" == "fileshare" ]]; then
     ok "Fileshare cert at $AGENT_DATA/share.crt"
   fi
 fi
-if [[ "$ARG_TYPE" == "ssh" ]]; then
+if [[ "$ARG_TYPE" == "ssh" || "$ARG_TYPE" == "fileshare" ]]; then
   if [[ ! -f "$AGENT_DATA/ssh_host_rsa_key" ]]; then
     log "Generating sensor SSH host key…"
     ssh-keygen -q -t rsa -b 2048 -f "$AGENT_DATA/ssh_host_rsa_key" -N "" -C "ubuntu-prod-01"
@@ -575,6 +577,26 @@ if [[ "$ARG_TYPE" == "ssh" ]]; then
     chmod 0640 "$AGENT_DATA/ssh_host_rsa_key"
     chmod 0644 "$AGENT_DATA/ssh_host_rsa_key.pub" 2>/dev/null || true
     ok "SSH host key generated"
+  fi
+fi
+
+# Pre-generate the per-VM fake universe (used by ssh + fileshare sensors).
+# Done as root because the sensor user can't write into $AGENT_DATA.
+# Idempotent: load_or_create reads the existing file if present.
+if [[ "$ARG_TYPE" == "ssh" || "$ARG_TYPE" == "fileshare" ]]; then
+  if [[ ! -f "$AGENT_DATA/fake_world.json" ]]; then
+    log "Generating per-VM fake universe…"
+    "$AGENT_INSTALL/venv/bin/python" - <<PYEOF
+import sys
+sys.path.insert(0, "$AGENT_INSTALL")
+from $PKG_NAME.sensors.fake_world import FakeWorld
+from pathlib import Path
+w = FakeWorld.load_or_create("$AGENT_NAME", Path("$AGENT_DATA/fake_world.json"))
+print("  org:", w.values["org_short"], " int_domain:", w.values["int_domain"])
+PYEOF
+    chown "$SENSOR_USER":"$SHARED_GROUP" "$AGENT_DATA/fake_world.json"
+    chmod 0640 "$AGENT_DATA/fake_world.json"
+    ok "Fake universe at $AGENT_DATA/fake_world.json"
   fi
 fi
 

@@ -114,14 +114,22 @@ class FakeWorld:
     @classmethod
     def load_or_create(cls, agent_name: str,
                        state_path: Optional[Path] = None) -> "FakeWorld":
-        """Load from state_path if present; otherwise generate fresh and save."""
-        if state_path is not None and state_path.exists():
+        """Load from state_path if present; otherwise generate fresh and save.
+
+        All filesystem I/O is wrapped in try/except so a sensor without write
+        access to its data dir, or a missing/corrupt file, still gets a valid
+        in-memory universe (regenerated on each start until persistence works).
+        """
+        if state_path is not None:
+            # Don't call .exists() — Python 3.11 propagates PermissionError
+            # from underlying stat() instead of returning False. Just try to
+            # read and let except handle "not there" the same as "can't read".
             try:
                 doc = json.loads(state_path.read_text())
                 if doc.get("schema") == cls.SCHEMA_VERSION:
                     return cls(agent_name, doc["values"])
             except Exception:
-                pass  # corrupt or old — regenerate
+                pass  # missing, corrupt, or no permission — regenerate
 
         values = cls._generate(agent_name)
         if state_path is not None:

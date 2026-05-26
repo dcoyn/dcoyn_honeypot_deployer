@@ -20,7 +20,7 @@ repos and produces fleet-wide IOC feeds.
 | `ssh`       | 22 (real sshd moves to 62222)               | SSH auth attempts, kex, exec/shell commands, file drops, canary file exfil |
 | `owa`       | 80, 443 (self-signed TLS)                   | HTTP method/path/headers/body, login POSTs, scanner paths |
 | `winserver` | 135, 139, 445, 1433, 3389, 5985, 47001, 49152 | TCP payloads + plausible service banners (SMB2, MSSQL TDS, RDP X.224, WinRM) |
-| `fileshare` | 80, 443 (self-signed TLS)                   | HTTP request log + per-download canary tracking. Apache-autoindex-style open share with bait docs (`.env`, `.git/`, SQL dumps, credentials.txt, DOCX/XLSX/HTML canaries that beacon home when opened). |
+| `fileshare` | 22 + 80 + 443 (real sshd moves to 62222)    | Linux box honeypot: Apache-style open share on 80/443 **and** the SSH sensor on 22. Bait docs (`.env`, `.git/`, SQL dumps, credentials.txt, DOCX/XLSX/HTML canaries) plus the full fake shell. Both sensors share the same per-VM FakeWorld, so the universe (org name, secrets, customer roster) is identical across all ports. |
 | `random`    | one of the above, picked at install         | — |
 
 On every profile: nftables connection log, JA3+JA4 fingerprinting via

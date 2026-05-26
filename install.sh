@@ -659,10 +659,17 @@ cat > "/etc/rsyslog.d/30-$AGENT_NAME.conf" <<EOF
 & stop
 EOF
 INSTALLED_FILES+=("/etc/rsyslog.d/30-$AGENT_NAME.conf")
-systemctl restart rsyslog 2>/dev/null || warn "rsyslog restart failed"
+# Pre-create the file with the correct owner+mode BEFORE rsyslog restarts.
+# rsyslog appends to an existing file without changing ownership, so this
+# locks in mode 0644 root:adm — readable by the connlog user (it's in adm),
+# readable by 'others' (file mode), but the parent dir 2770 prevents non-
+# group access. We do NOT need the file to be writable by connlog because
+# connlog only reads it.
 touch "$AGENT_LOGS/kernel-connections.log"
 chown root:adm "$AGENT_LOGS/kernel-connections.log" 2>/dev/null \
   || chown root:root "$AGENT_LOGS/kernel-connections.log"
+chmod 0644 "$AGENT_LOGS/kernel-connections.log"
+systemctl restart rsyslog 2>/dev/null || warn "rsyslog restart failed"
 
 # Per-agent env file (read by systemd)
 cat > "$AGENT_ETC/env" <<EOF

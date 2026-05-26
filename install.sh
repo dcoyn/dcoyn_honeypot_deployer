@@ -586,9 +586,9 @@ fi
 if [[ "$ARG_TYPE" == "ssh" || "$ARG_TYPE" == "fileshare" ]]; then
   if [[ ! -f "$AGENT_DATA/fake_world.json" ]]; then
     log "Generating per-VM fake universe…"
-    "$AGENT_INSTALL/venv/bin/python" - <<PYEOF
+    "$AGENT_HOME/venv/bin/python" - <<PYEOF
 import sys
-sys.path.insert(0, "$AGENT_INSTALL")
+sys.path.insert(0, "$AGENT_HOME")
 from $PKG_NAME.sensors.fake_world import FakeWorld
 from pathlib import Path
 w = FakeWorld.load_or_create("$AGENT_NAME", Path("$AGENT_DATA/fake_world.json"))

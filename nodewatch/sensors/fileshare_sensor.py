@@ -57,6 +57,154 @@ from .fake_world import FakeWorld
 from .fake_fs import FakeFS, DEFAULT_CANARY_BASE
 
 
+# ================================================================ canary beacon
+#
+# When the attacker exfiltrates a bait DOCX/XLSX and opens it on their own
+# machine, MS Office / LibreOffice fetches the embedded external image. That
+# fetch hits a URL of the form  ``{canary_base}/{agent}/{download_id}/{token}.png``
+# (built by FakeFS._build_canary_docx). If HP_CANARY_URL is set to the URL of
+# *this* honeypot, the beacon hits the route below — and we get the opener's
+# OS, Office version, locale, and IP (often DIFFERENT from the IP that
+# originally downloaded the file).
+
+_PNG_1X1 = base64.b64decode(
+    b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lE"
+    b"QVR42mP8/x8AAusB9bdfQOEAAAAASUVORK5CYII=")
+
+_BEACON_PATH_RE = re.compile(
+    r"^/(?:b/)?(?P<agent>[A-Za-z0-9._-]{1,64})/"
+    r"(?P<download_id>[A-Za-z0-9._-]{4,64})/"
+    r"(?P<token>[A-Za-z0-9._-]{4,64})"
+    r"\.(?P<ext>png|gif|jpg|jpeg|ico|webp|svg)$"
+)
+
+_OFFICE_VER_RE  = re.compile(r"microsoft\s*office/?\s*(\d+(?:\.\d+)?)", re.I)
+_OFFICE_APP_RE  = re.compile(r"\b(word|excel|powerpoint|outlook|onenote|access|visio)\b", re.I)
+_LIBRE_VER_RE   = re.compile(r"libreoffice/?\s*(\d+(?:\.\d+)?)", re.I)
+_WIN_NT_RE      = re.compile(r"windows nt (\d+\.\d+)", re.I)
+_MACOS_RE       = re.compile(r"mac os x (\d+[._]\d+(?:[._]\d+)?)", re.I)
+_ANDROID_RE     = re.compile(r"android\s+(\d+(?:\.\d+)?)", re.I)
+
+_WIN_NT_MAP = {
+    "10.0": "Windows 10 / 11",
+    "6.3":  "Windows 8.1 / Server 2012 R2",
+    "6.2":  "Windows 8 / Server 2012",
+    "6.1":  "Windows 7 / Server 2008 R2",
+    "6.0":  "Windows Vista / Server 2008",
+    "5.2":  "Windows XP x64 / Server 2003",
+    "5.1":  "Windows XP",
+}
+
+
+def _parse_canary_metadata(headers: dict) -> dict:
+    """Pull every useful fingerprint we can from the beacon request headers.
+
+    Returns a dict suitable for embedding as ``data`` on the canary event.
+    Keys are intentionally flat so they survive jsonl round-trips."""
+    ua = headers.get("User-Agent") or ""
+    al = headers.get("Accept-Language") or ""
+    out: dict = {
+        "user_agent":      ua,
+        "accept_language": al,
+        "all_headers":     {k: (v[:512] if isinstance(v, str) else v)
+                             for k, v in headers.items()},
+    }
+    ua_low = ua.lower()
+
+    # ---- OS detection ----
+    if m := _WIN_NT_RE.search(ua_low):
+        out["opener_os"]         = "Windows"
+        out["opener_os_version"] = _WIN_NT_MAP.get(m.group(1), m.group(1))
+        out["opener_os_kernel"]  = f"Windows NT {m.group(1)}"
+        # Architecture
+        if "win64" in ua_low or "wow64" in ua_low or "x64" in ua_low:
+            out["opener_arch"] = "x86_64"
+        elif "arm64" in ua_low or "aarch64" in ua_low:
+            out["opener_arch"] = "arm64"
+    elif m := _MACOS_RE.search(ua_low):
+        out["opener_os"]         = "macOS"
+        out["opener_os_version"] = m.group(1).replace("_", ".")
+        if "arm64" in ua_low or "apple silicon" in ua_low:
+            out["opener_arch"] = "arm64"
+        elif "intel" in ua_low:
+            out["opener_arch"] = "x86_64"
+    elif m := _ANDROID_RE.search(ua_low):
+        out["opener_os"]         = "Android"
+        out["opener_os_version"] = m.group(1)
+    elif "iphone" in ua_low or "ipad" in ua_low:
+        out["opener_os"] = "iOS"
+    elif "linux" in ua_low or "x11" in ua_low:
+        out["opener_os"] = "Linux"
+        if "x86_64" in ua_low: out["opener_arch"] = "x86_64"
+        elif "aarch64" in ua_low or "arm64" in ua_low: out["opener_arch"] = "arm64"
+
+    # ---- App detection ----
+    if "microsoft office" in ua_low or "ms-office" in ua_low \
+       or "msoffice" in ua_low or "non-browser" in ua_low:
+        out["opener_app_family"] = "Microsoft Office"
+        if m := _OFFICE_VER_RE.search(ua):
+            v = m.group(1)
+            out["opener_app_version"] = v
+            try:
+                major = float(v)
+                if major >= 16:   out["opener_app_release"] = "Office 2016 / 2019 / 2021 / 365"
+                elif major >= 15: out["opener_app_release"] = "Office 2013"
+                elif major >= 14: out["opener_app_release"] = "Office 2010"
+                elif major >= 12: out["opener_app_release"] = "Office 2007"
+            except ValueError:
+                pass
+        if m := _OFFICE_APP_RE.search(ua):
+            out["opener_app_specific"] = f"Microsoft {m.group(1).title()}"
+    elif "libreoffice" in ua_low:
+        out["opener_app_family"] = "LibreOffice"
+        if m := _LIBRE_VER_RE.search(ua):
+            out["opener_app_version"] = m.group(1)
+    elif "openoffice" in ua_low or "apache_openoffice" in ua_low:
+        out["opener_app_family"] = "OpenOffice"
+    elif "wps" in ua_low or "kingsoft" in ua_low:
+        out["opener_app_family"] = "WPS Office"
+        if "wps" in ua_low and (m := re.search(r"wps[^/]*/?\s*(\d+(?:\.\d+)?)", ua_low)):
+            out["opener_app_version"] = m.group(1)
+    elif "google-apps-viewer" in ua_low or "gdocs" in ua_low:
+        out["opener_app_family"] = "Google Docs Viewer"
+    elif "ms-officeexistencediscovery" in ua_low.replace(" ", ""):
+        out["opener_app_family"] = "Office Existence Discovery probe"
+    elif "curl" in ua_low:    out["opener_app_family"] = "curl"
+    elif "wget" in ua_low:    out["opener_app_family"] = "wget"
+    elif "python" in ua_low:  out["opener_app_family"] = "Python"
+    elif "powershell" in ua_low: out["opener_app_family"] = "PowerShell"
+    elif any(b in ua_low for b in ("chrome/", "firefox/", "safari/", "edge/", "edg/")):
+        out["opener_app_family"] = "Browser"
+
+    # ---- Locale / keyboard languages ----
+    if al:
+        prefs: list[str] = []
+        for part in al.split(","):
+            tag = part.split(";")[0].strip()
+            if tag and tag.lower() != "*":
+                prefs.append(tag)
+        if prefs:
+            out["opener_primary_locale"] = prefs[0]
+            out["opener_locales"]        = prefs
+            # Pull bare language codes (en-US -> en, ru-RU -> ru)
+            langs = sorted({p.split("-")[0].lower() for p in prefs})
+            out["opener_languages"]      = langs
+            # Hint at OS keyboard layout (country-specific tags imply it)
+            country_tags = [p for p in prefs if "-" in p]
+            if country_tags:
+                out["opener_country_hints"] = [p.split("-", 1)[1].upper()
+                                                for p in country_tags[:5]]
+
+    # Some non-IE Windows boxes leak machine/domain via X-Forwarded headers
+    # or custom proxy headers. Capture anything that looks identifying.
+    for k, v in headers.items():
+        kl = k.lower()
+        if any(x in kl for x in ("computer", "machine", "host-name", "workstation")):
+            out.setdefault("opener_machine_hints", {})[k] = v[:256]
+
+    return out
+
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024  # 1MB max body — generous for POSTs
 
@@ -125,6 +273,28 @@ def _log_request(event_type: str, extra: Optional[dict] = None) -> None:
 @app.before_request
 def _trace():
     request.environ["_HP_T0"] = time.monotonic()
+
+    # Canary beacon URL? (Document fetched by Word/Excel/LibreOffice on
+    # attacker's machine when they OPEN the bait file we let them exfil.
+    # We get the opener's UA, locale, headers — sometimes a different IP
+    # than the original downloader, which is hugely valuable for attribution.)
+    m = _BEACON_PATH_RE.match(request.path)
+    if m:
+        parsed = _parse_canary_metadata({k: v for k, v in request.headers.items()})
+        _log_request(EventType.HTTP_REQUEST, {
+            "canary_event":         "canary_beacon_received",
+            "canary_agent":          m.group("agent"),
+            "canary_download_id":    m.group("download_id"),
+            "canary_token":          m.group("token"),
+            "canary_beacon_ext":     m.group("ext"),
+            **parsed,
+        })
+        return make_response(_PNG_1X1, 200, {
+            "Content-Type":  "image/png",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Server":        "Apache/2.4.41 (Ubuntu)",
+        })
+
     _log_request(EventType.HTTP_REQUEST)
 
 

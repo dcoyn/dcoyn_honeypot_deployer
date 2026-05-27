@@ -819,10 +819,41 @@ chmod 0644 "$AGENT_LOGS/kernel-connections.log"
 systemctl restart rsyslog 2>/dev/null || warn "rsyslog restart failed"
 
 # Per-agent env file (read by systemd)
+#
+# HP_CANARY_URL: where the embedded image in canary DOCX/XLSX files points.
+# When the attacker opens the bait on their machine, Office fetches this URL —
+# so it must be a server we control + monitor. For fileshare deployments we
+# default to the local fileshare's own public URL (the attacker already knows
+# this host's IP since they downloaded the file from it). For SSH-only or
+# winserver deployments, the operator should set HP_CANARY_URL to point at
+# one of their fileshare honeypots (which has the beacon receiver enabled).
+if [ -z "${HP_CANARY_URL:-}" ]; then
+  case "$PROFILE" in
+    fileshare)
+      # Best-effort public URL of this host. The fileshare sensor's beacon
+      # route accepts any vhost, so the bare IP is fine.
+      _public_ip=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+                    || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
+                    || hostname -I | awk '{print $1}')
+      HP_CANARY_URL="https://${_public_ip}"
+      log "  HP_CANARY_URL not set — defaulting to https://${_public_ip}"
+      log "  (beacons from opened canaries will hit this fileshare's beacon route)"
+      ;;
+    *)
+      HP_CANARY_URL=""
+      warn "HP_CANARY_URL not set for $PROFILE profile."
+      warn "Canary opens will not be captured. Set HP_CANARY_URL to one of"
+      warn "your fileshare honeypots so beacons hit a receiver:"
+      warn "  HP_CANARY_URL=https://<fileshare-vm-ip> bash install.sh ..."
+      ;;
+  esac
+fi
+
 cat > "$AGENT_ETC/env" <<EOF
 HP_CONFIG=$AGENT_HOME/config.json
 HP_NFT_PREFIX=$NFT_PREFIX_UP
 HP_CONNLOG_PATH=$AGENT_LOGS/kernel-connections.log
+HP_CANARY_URL=$HP_CANARY_URL
 EOF
 chmod 0644 "$AGENT_ETC/env"
 INSTALLED_FILES+=("$AGENT_ETC/env")

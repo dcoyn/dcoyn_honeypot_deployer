@@ -175,9 +175,11 @@ export HP_GIT_TOKEN \
        HP_CANARY_URL="${HP_CANARY_URL:-}" \
        HP_NONINTERACTIVE=1
 
-# Pull and run the latest installer
+# Pull and run the latest installer (cache-bust against raw.githubusercontent
+# CDN edges — they sometimes serve stale content for a few minutes after push)
 TMPI=$(mktemp -t install.XXXXXX.sh)
-curl -fsSL "$INSTALLER_URL" -o "$TMPI"
+_cb_url="${INSTALLER_URL}?nocache=$(date +%s).$$"
+curl -fsSL "$_cb_url" -o "$TMPI"
 bash "$TMPI"
 rm -f "$TMPI"
 

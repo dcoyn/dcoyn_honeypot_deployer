@@ -172,6 +172,7 @@ export HP_GIT_TOKEN \
        HP_TYPE="$PROFILE" \
        HP_AGENT_NAME="$AGENT_NAME" \
        HP_NODE_NAME="$NODE_NAME" \
+       HP_CANARY_URL="${HP_CANARY_URL:-}" \
        HP_NONINTERACTIVE=1
 
 # Pull and run the latest installer
@@ -180,7 +181,7 @@ curl -fsSL "$INSTALLER_URL" -o "$TMPI"
 bash "$TMPI"
 rm -f "$TMPI"
 
-unset HP_GIT_TOKEN HP_REPO HP_TYPE HP_AGENT_NAME HP_NODE_NAME HP_NONINTERACTIVE
+unset HP_GIT_TOKEN HP_REPO HP_TYPE HP_AGENT_NAME HP_NODE_NAME HP_CANARY_URL HP_NONINTERACTIVE
 
 # --------- verify ---------
 echo

@@ -828,7 +828,7 @@ systemctl restart rsyslog 2>/dev/null || warn "rsyslog restart failed"
 # winserver deployments, the operator should set HP_CANARY_URL to point at
 # one of their fileshare honeypots (which has the beacon receiver enabled).
 if [ -z "${HP_CANARY_URL:-}" ]; then
-  case "$PROFILE" in
+  case "$ARG_TYPE" in
     fileshare)
       # Best-effort public URL of this host. The fileshare sensor's beacon
       # route accepts any vhost, so the bare IP is fine.
@@ -841,7 +841,7 @@ if [ -z "${HP_CANARY_URL:-}" ]; then
       ;;
     *)
       HP_CANARY_URL=""
-      warn "HP_CANARY_URL not set for $PROFILE profile."
+      warn "HP_CANARY_URL not set for $ARG_TYPE profile."
       warn "Canary opens will not be captured. Set HP_CANARY_URL to one of"
       warn "your fileshare honeypots so beacons hit a receiver:"
       warn "  HP_CANARY_URL=https://<fileshare-vm-ip> bash install.sh ..."

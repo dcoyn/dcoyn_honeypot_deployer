@@ -142,6 +142,90 @@ def run() -> dict:
         if et == "ssh_command":
             ipd["commands_run"] = ipd.get("commands_run", 0) + 1
 
+        # ---- attacker intelligence rollups ----
+        intel = data.get("intel") or {}
+        src_intel = intel.get("source") or {}
+        if src_intel.get("infra"):
+            ipd["infra"] = src_intel["infra"]
+        if src_intel.get("provider"):
+            ipd["provider"] = src_intel["provider"]
+        if intel.get("automated") is True:
+            ipd["automated"] = True
+        sc = intel.get("ssh_client") or {}
+        if sc.get("tool") and sc["tool"] != "unknown":
+            ipd.setdefault("ssh_tools", set()).add(sc["tool"])
+        hc = intel.get("http_client") or {}
+        if hc.get("ua_class") and hc["ua_class"] not in ("unknown", "empty"):
+            ipd.setdefault("http_tools", set()).add(hc["ua_class"])
+
+        # HASSH from passive sniffer
+        if et == "ssh_fingerprint" and data.get("hassh"):
+            ipd.setdefault("hassh", set()).add(data["hassh"])
+
+        # MITRE ATT&CK techniques + attack categories, from command / http classification
+        cl = data.get("classification") or {}
+        for tech in cl.get("techniques", []):
+            ipd.setdefault("attack_techniques", set()).add(tech)
+        cat = cl.get("category")
+        if cat and cat not in ("navigation", "empty", "other"):
+            ac = ipd.setdefault("attack_categories", {})
+            ac[cat] = ac.get(cat, 0) + 1
+        for ioc_ip in (cl.get("iocs") or {}).get("ips", []):
+            ipd.setdefault("ioc_ips", set()).add(ioc_ip)
+        for ioc_url in (cl.get("iocs") or {}).get("urls", []):
+            ipd.setdefault("ioc_urls", set()).add(ioc_url)
+        # Redis attack chains + telnet botnet probes
+        if et == "redis_command" and data.get("attack_chain"):
+            ipd.setdefault("redis_attack_chains", set()).add(data["attack_chain"])
+        if et == "telnet_command" and data.get("botnet_probe"):
+            ipd["botnet_probe"] = True
+        for tech in data.get("techniques", []):  # redis emits techniques directly
+            ipd.setdefault("attack_techniques", set()).add(tech)
+
+        # ---- Docker API attack intelligence ----
+        if et in ("docker_api", "docker_container_create"):
+            for chain in data.get("attack_chains", []):
+                ipd.setdefault("docker_attack_chains", set()).add(chain)
+            for u in data.get("ioc_urls", []):
+                ipd.setdefault("ioc_urls", set()).add(u)
+            for ip4 in data.get("ioc_ips", []):
+                ipd.setdefault("ioc_ips", set()).add(ip4)
+            if data.get("image"):
+                ipd.setdefault("docker_images", set()).add(data["image"][:200])
+            for w in data.get("monero_wallets", []):
+                ipd.setdefault("crypto_wallets", set()).add(w)
+            for p in data.get("mining_pools", []):
+                ipd.setdefault("mining_pools", set()).add(p)
+            if et == "docker_container_create":
+                ipd["deployed_container"] = True
+            if any(c in ("host_filesystem_mount_escape", "privileged_container_escape",
+                         "host_namespace_escape", "nsenter_host_escape")
+                   for c in data.get("attack_chains", [])):
+                ipd["docker_host_escape_attempt"] = True
+
+        # ---- canary beacon intelligence ----
+        ce = data.get("canary_event")
+        if ce == "canary_beacon_received":
+            ipd["opened_canary"] = True
+            if data.get("canary_slot"):
+                ipd.setdefault("canary_slots_fired", set()).add(data["canary_slot"])
+            if data.get("opener_kind"):
+                ipd["opener_kind"] = data["opener_kind"]
+            # If this opener is a different IP than the downloader, record the
+            # link so the scorecard shows the exfil→detonation relationship.
+            if data.get("opener_is_different_ip") and data.get("downloader_ip"):
+                ipd.setdefault("downloaded_from_ips", set()).add(data["downloader_ip"])
+        elif ce == "canary_ntlm_credentials_captured":
+            ipd["captured_credentials"] = True
+            cred = {k: data.get(k) for k in ("domain", "username", "workstation")
+                    if data.get(k)}
+            if cred:
+                # store as a compact "DOMAIN\\user@host" string set
+                tag = f"{cred.get('domain','')}\\{cred.get('username','')}@{cred.get('workstation','')}"
+                ipd.setdefault("captured_identities", set()).add(tag)
+            if data.get("netntlmv2"):
+                ipd.setdefault("captured_netntlmv2", set()).add(data["netntlmv2"][:600])
+
         # ---- session summary ---
         if sid:
             sd = sess_updates[sid]
@@ -176,7 +260,13 @@ def run() -> dict:
     for ip, upd in ip_updates.items():
         path = repo / "ips" / f"{ip}.json"
         existing = _load_json(path, {})
-        for k in ("ports_hit", "sensors", "sessions", "user_agents", "ja3", "ja4"):
+        for k in ("ports_hit", "sensors", "sessions", "user_agents", "ja3", "ja4",
+                  "ssh_tools", "http_tools", "hassh", "attack_techniques",
+                  "ioc_ips", "ioc_urls", "redis_attack_chains",
+                  "canary_slots_fired", "downloaded_from_ips",
+                  "captured_identities", "captured_netntlmv2",
+                  "docker_attack_chains", "docker_images", "crypto_wallets",
+                  "mining_pools"):
             if k in upd and isinstance(upd[k], set):
                 upd[k] = sorted(upd[k])
             if k in existing and isinstance(existing[k], list):
@@ -185,6 +275,20 @@ def run() -> dict:
         for k in ("event_count", "cred_attempts", "cred_successes", "commands_run"):
             if k in upd:
                 upd[k] = existing.get(k, 0) + upd.get(k, 0)
+        # attack_categories: per-category counters
+        if "attack_categories" in upd or "attack_categories" in existing:
+            merged = dict(existing.get("attack_categories", {}))
+            for k, v in upd.get("attack_categories", {}).items():
+                merged[k] = merged.get(k, 0) + v
+            upd["attack_categories"] = merged
+        # sticky boolean flags
+        for k in ("automated", "botnet_probe", "opened_canary", "captured_credentials",
+                  "deployed_container", "docker_host_escape_attempt"):
+            if existing.get(k) or upd.get(k):
+                upd[k] = True
+        for k in ("infra", "provider", "opener_kind"):
+            if k not in upd and k in existing:
+                upd[k] = existing[k]
         if "event_types" in upd:
             merged = dict(existing.get("event_types", {}))
             for k, v in upd["event_types"].items():

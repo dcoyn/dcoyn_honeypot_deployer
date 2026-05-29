@@ -23,9 +23,10 @@ from pathlib import Path
 from ..config import Config
 from ..core import logger as L
 from ..core.logger import EventType
-from ..core.fingerprint import fingerprint
+from ..core.fingerprint import fingerprint, ssh_fingerprint
 from ..core.session import TRACKER
 from ..core.enrichment import enrich
+from ..core import threat_intel as TI
 
 try:
     from scapy.all import sniff, TCP, IP, IPv6, Raw, wrpcap
@@ -43,11 +44,20 @@ def _maybe_handshake(buf: bytes) -> bool:
     return len(buf) >= 6 and buf[0] == 0x16 and buf[5] == 0x01  # handshake + ClientHello
 
 
+def _maybe_ssh(buf: bytes) -> bool:
+    return buf[:4] == b"SSH-"
+
+
+# Track which flows we've already SSH-fingerprinted so we emit once per flow.
+_SSH_DONE: set = set()
+
+
 def _flush_after(flow_key):
     """Drop a flow buffer 30s after the handshake (or after failure)."""
     time.sleep(30)
     with _PENDING_LOCK:
         _PENDING.pop(flow_key, None)
+        _SSH_DONE.discard(flow_key)
 
 
 def _handle(pkt) -> None:
@@ -71,6 +81,28 @@ def _handle(pkt) -> None:
         if len(buf) > _MAX_BUF:
             _PENDING.pop(flow_key, None)
             return
+
+        # --- SSH branch: stream starts with "SSH-" version banner ---
+        if _maybe_ssh(bytes(buf[:4])):
+            if flow_key in _SSH_DONE:
+                return
+            snapshot = bytes(buf)
+            fp = ssh_fingerprint(snapshot)
+            if fp is None:
+                return  # KEXINIT not fully reassembled yet; keep buffering
+            _SSH_DONE.add(flow_key)
+            _PENDING.pop(flow_key, None)
+            sid = TRACKER.get(src)
+            L.get().emit(
+                EventType.SSH_FINGERPRINT,
+                src_ip=src, src_port=src_port, dst_port=dst_port,
+                session_id=sid,
+                data={**fp, "geo": enrich(src),
+                      "intel": TI.tag_event(src, enrich(src))},
+            )
+            threading.Thread(target=_flush_after, args=(flow_key,), daemon=True).start()
+            return
+
         if not _maybe_handshake(buf):
             # Not TLS — keep collecting up to a small bound, then give up
             if len(buf) > 1024 and not _maybe_handshake(bytes(buf[:6])):

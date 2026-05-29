@@ -20,11 +20,13 @@ repos and produces fleet-wide IOC feeds.
 | `ssh`       | 22 (real sshd moves to 62222)               | SSH auth attempts, kex, exec/shell commands, file drops, canary file exfil |
 | `owa`       | 80, 443 (self-signed TLS)                   | HTTP method/path/headers/body, login POSTs, scanner paths |
 | `winserver` | 135, 139, 445, 1433, 3389, 5985, 47001, 49152 | TCP payloads + plausible service banners (SMB2, MSSQL TDS, RDP X.224, WinRM) |
+| `telnet`    | 23                                          | IoT/Mirai magnet: fake BusyBox login + shell. Logs every credential and command, flags the BusyBox/`MIRAI` arch-probe as a botnet IOC |
+| `redis`     | 6379                                        | Speaks the RESP wire protocol. Logs every command and recognizes the classic unauth-Redis RCE chains (SSH-key write, cron write, `MODULE LOAD`, `SLAVEOF` replication) |
+| `docker`    | 2375                                        | Fake **Docker Engine API**. Speaks enough REST to keep cryptojacking bots (Kinsing/TeamTNT-style) talking, and captures the `/containers/create` payload: the image pulled, the command run, host bind-mounts / privileged / host-namespace **escape attempts** (T1611), miner images, mining pools, and IOC URLs — all classified to MITRE ATT&CK |
 | `fileshare` | 22 + 80 + 443 (real sshd moves to 62222)    | Linux box honeypot: Apache-style open share on 80/443 **and** the SSH sensor on 22. Bait docs (`.env`, `.git/`, SQL dumps, credentials.txt, DOCX/XLSX/HTML canaries) plus the full fake shell. Both sensors share the same per-VM FakeWorld, so the universe (org name, secrets, customer roster) is identical across all ports. |
 | `random`    | one of the above, picked at install         | — |
 
-On every profile: nftables connection log, JA3+JA4 fingerprinting via
-passive sniff, PTR lookup, 300 s session tracking.
+On every profile: nftables connection log, JA3+JA4 fingerprinting **plus passive HASSH (SSH client) fingerprinting** via the sniff sidecar, PTR + GeoIP/ASN lookup, offline threat-intel tagging (hosting/cloud/Tor + SSH-tool/UA classification), MITRE ATT&CK classification of every command and HTTP path, and 300 s session tracking.
 
 ## Install
 
@@ -127,7 +129,7 @@ real sshd to port 62222 for `ssh`/`random` profiles.
 
 | Variable             | Default                          | Description |
 |----------------------|----------------------------------|-------------|
-| `HP_TYPE`            | (required)                       | `ssh` \| `owa` \| `winserver` \| `fileshare` \| `random` |
+| `HP_TYPE`            | (required)                       | `ssh` \| `owa` \| `winserver` \| `fileshare` \| `telnet` \| `redis` \| `docker` \| `random` |
 | `HP_CANARY_URL`      | (empty)                          | Base URL embedded in canary docs (DOCX/XLSX/HTML). Beacon hits land here when an attacker opens an exfiltrated file. Operator-controlled; e.g. another OWA honeypot's URL, or a canarytokens.org token URL, or a dedicated webhook receiver. |
 | `HP_REPO`            | (required)                       | Per-VM logs repo URL (`https://github.com/<owner>/<repo>.git`) |
 | `HP_GIT_TOKEN`       | (required)                       | PAT for `HP_REPO`, `Contents: Read+write` |
@@ -250,9 +252,35 @@ by git (anything under `.git/` is ignored by definition).
 ```
 
 Event types: `node_start`, `connection`, `tcp_payload`, `tls_fingerprint`,
-`ssh_session_start`, `ssh_banner`, `ssh_auth`, `ssh_login_ok`, `ssh_command`,
-`ssh_session_end`, `http_request`, `http_login`, `win_probe`, `win_payload`,
-`heartbeat`.
+`ssh_fingerprint` (HASSH), `ssh_session_start`, `ssh_banner`, `ssh_auth`,
+`ssh_login_ok`, `ssh_command`, `ssh_session_end`, `http_request`, `http_login`,
+`win_probe`, `win_payload`, `telnet_auth`, `telnet_command`,
+`telnet_session_end`, `redis_command`, `docker_api`,
+`docker_container_create`, `heartbeat`.
+
+### Attacker intelligence (added to `data` on most events)
+
+Every event now carries machine-derived intel so the central feed is
+analyst-ready without post-processing:
+
+- **`data.intel.source`** — `infra` (`cloud`/`hosting`/`vpn`/`tor`/`residential`)
+  and a normalized `provider` slug, derived offline from the ASN org string
+  (no extra feeds/downloads).
+- **`data.intel.ssh_client`** — which SSH *tool* connected, parsed from the
+  client banner (`openssh`/`putty` = likely human; `paramiko`/`libssh2`/`go-ssh`/
+  `zgrab`/`mirai` = automated), with an `automated` flag.
+- **`data.intel.http_client`** — UA bucket (`sqlmap`/`nuclei`/`curl`/`browser`…).
+- **`data.classification`** — for every shell command and HTTP path: an attack
+  `category`, the **MITRE ATT&CK** technique IDs it maps to, and extracted IOCs
+  (`urls`, `ips`, `dropped_files`).
+- **`ssh_fingerprint` events** carry **HASSH** (`hassh` md5 + offered
+  `kex`/`ciphers`/`macs`) — the SSH equivalent of JA3, so the same tool is
+  recognizable across IPs even when the version banner is spoofed.
+
+The aggregator rolls these up per IP into an attacker scorecard:
+`infra`, `provider`, `automated`, `ssh_tools`, `http_tools`, `hassh`,
+`attack_techniques` (ATT&CK), `attack_categories` (counts), `ioc_ips`,
+`ioc_urls`, `redis_attack_chains`, and `botnet_probe`.
 
 ## Repository layout
 
@@ -266,17 +294,23 @@ nodewatch/                          # renamed to kworker_XXXX at install
   core/
     logger.py                       # jsonl event sink
     session.py                      # sliding-window per-IP session tracker
-    enrichment.py                   # PTR lookup
-    fingerprint.py                  # JA3 + JA4 from raw TLS
+    enrichment.py                   # PTR + GeoIP/ASN lookup
+    fingerprint.py                  # JA3 + JA4 (TLS) + HASSH (SSH KEXINIT)
+    threat_intel.py                 # offline infra/SSH-tool/UA classification
+    classify.py                     # MITRE ATT&CK command + HTTP-path classifier
   sensors/
     ssh_sensor.py
     owa_sensor.py
     win_sensor.py
+    telnet_sensor.py                # port 23 — IoT/Mirai BusyBox honeypot
+    redis_sensor.py                 # port 6379 — RESP protocol, RCE-chain detection
+    docker_sensor.py                # port 2375 — fake Docker API, container-escape capture
+    beacon.py                       # universal canary beacon receiver (non-HTTP profiles)
   network/
-    packet_capture.py               # scapy sniffer → JA3/JA4
+    packet_capture.py               # scapy sniffer → JA3/JA4 + HASSH
     connection_logger.py            # nftables log tailer
   sync/
-    aggregator.py                   # builds per-node repo layout
+    aggregator.py                   # builds per-node repo layout + scorecards
     github_sync.py                  # pull --rebase + push
 templates/
   owa_login.html

@@ -148,27 +148,30 @@ ok "Pre-flight passed (kernel $(uname -r), ${RAM_MB}MB RAM, ${DISK_MB}MB disk)"
 # -----------------------------------------------------------------------------
 ARG_TYPE="${1:-${HP_TYPE:-}}"
 case "$ARG_TYPE" in
-  ssh|owa|winserver|fileshare) ;;
+  ssh|owa|winserver|fileshare|telnet|redis|docker) ;;
   random)
-    ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare)
+    ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare telnet redis docker)
     log "Random profile selected: $ARG_TYPE"
     ;;
   "")
     if [[ "${HP_NONINTERACTIVE:-0}" == "1" ]]; then
       die "Sensor profile not given. Pass as arg, or set HP_TYPE."
     fi
-    echo "Sensor profile? [1] ssh  [2] owa  [3] winserver  [4] fileshare  [5] random"
+    echo "Sensor profile? [1] ssh  [2] owa  [3] winserver  [4] fileshare  [5] telnet  [6] redis  [7] docker  [8] random"
     read -rp "> " choice
     case "$choice" in
       1) ARG_TYPE=ssh ;;
       2) ARG_TYPE=owa ;;
       3) ARG_TYPE=winserver ;;
       4) ARG_TYPE=fileshare ;;
-      5) ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare) ;;
+      5) ARG_TYPE=telnet ;;
+      6) ARG_TYPE=redis ;;
+      7) ARG_TYPE=docker ;;
+      8) ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare telnet redis docker) ;;
       *) die "Invalid choice." ;;
     esac
     ;;
-  *) die "Unknown profile: '$ARG_TYPE' (use ssh|owa|winserver|fileshare|random)" ;;
+  *) die "Unknown profile: '$ARG_TYPE' (use ssh|owa|winserver|fileshare|telnet|redis|docker|random)" ;;
 esac
 
 # -----------------------------------------------------------------------------
@@ -820,36 +823,31 @@ systemctl restart rsyslog 2>/dev/null || warn "rsyslog restart failed"
 
 # Per-agent env file (read by systemd)
 #
-# HP_CANARY_URL: where the embedded image in canary DOCX/XLSX files points.
-# When the attacker opens the bait on their machine, Office fetches this URL —
-# so it must be a server we control + monitor. For fileshare deployments we
-# default to the local fileshare's own public URL (the attacker already knows
-# this host's IP since they downloaded the file from it). For SSH-only or
-# winserver deployments, the operator should set HP_CANARY_URL to point at
-# one of their fileshare honeypots (which has the beacon receiver enabled).
+# HP_CANARY_URL: where the embedded beacons in canary DOCX/XLSX/HTML files
+# point. When an attacker opens a bait file on their machine, Office/Windows
+# fetches this URL — so it must be a host we control and monitor. Every profile
+# now runs a beacon receiver (the fileshare/owa sensors handle it inline; ssh/
+# telnet/redis/winserver start a small receiver on 80/443 alongside the sensor),
+# so we ALWAYS default this to this same host's public URL. The attacker already
+# knows this IP — they pulled the bait from here.
+#
+# We use http:// (port 80) NOT https:// — a self-signed cert makes Office
+# silently refuse to fetch external resources, whereas plain HTTP fires
+# reliably. The beacon receiver listens on both 80 and 443 regardless.
 if [ -z "${HP_CANARY_URL:-}" ]; then
-  case "$ARG_TYPE" in
-    fileshare)
-      # Best-effort public URL of this host. We use http:// (port 80) NOT
-      # https:// — the fileshare's TLS cert is self-signed, and Word/Excel
-      # silently refuse to fetch an external image from an untrusted-cert
-      # host. Plain HTTP on port 80 fires reliably. The fileshare sensor
-      # binds both 80 and 443, so the beacon route is reachable either way.
-      _public_ip=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
-                    || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
-                    || hostname -I | awk '{print $1}')
-      HP_CANARY_URL="http://${_public_ip}"
-      log "  HP_CANARY_URL not set — defaulting to http://${_public_ip}"
-      log "  (beacons from opened canaries will hit this fileshare's beacon route)"
-      ;;
-    *)
-      HP_CANARY_URL=""
-      warn "HP_CANARY_URL not set for $ARG_TYPE profile."
-      warn "Canary opens will not be captured. Set HP_CANARY_URL to one of"
-      warn "your fileshare honeypots so beacons hit a receiver:"
-      warn "  HP_CANARY_URL=https://<fileshare-vm-ip> bash install.sh ..."
-      ;;
-  esac
+  _public_ip=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
+                || curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null \
+                || hostname -I | awk '{print $1}')
+  if [ -n "${_public_ip:-}" ]; then
+    HP_CANARY_URL="http://${_public_ip}"
+    log "  HP_CANARY_URL not set — defaulting to http://${_public_ip}"
+    log "  (canary opens beacon back to this host's receiver automatically)"
+  else
+    HP_CANARY_URL=""
+    warn "Could not determine this host's public IP and HP_CANARY_URL is unset."
+    warn "Canary opens won't be captured until you set HP_CANARY_URL to this"
+    warn "host (e.g. HP_CANARY_URL=http://<this-vm-ip>) and reinstall."
+  fi
 fi
 
 cat > "$AGENT_ETC/env" <<EOF

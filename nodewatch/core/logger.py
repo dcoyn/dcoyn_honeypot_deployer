@@ -46,6 +46,7 @@ class EventType:
     CONNECTION       = "connection"          # raw new connection (any port)
     TCP_PAYLOAD      = "tcp_payload"         # bytes received on a listening port
     TLS_FINGERPRINT  = "tls_fingerprint"     # ja3/ja4 extracted from clienthello
+    SSH_FINGERPRINT  = "ssh_fingerprint"     # hassh extracted from kexinit (passive)
     SSH_BANNER       = "ssh_banner"          # remote SSH banner / version
     SSH_AUTH         = "ssh_auth"            # username/password attempt
     SSH_LOGIN_OK     = "ssh_login_ok"        # accepted credential set
@@ -55,6 +56,12 @@ class EventType:
     HTTP_LOGIN       = "http_login"          # OWA POST creds
     WIN_PROBE        = "win_probe"           # connection to a fake windows port
     WIN_PAYLOAD      = "win_payload"         # bytes captured on a fake windows service
+    TELNET_AUTH      = "telnet_auth"         # telnet login attempt (IoT/Mirai)
+    TELNET_COMMAND   = "telnet_command"      # command run in fake telnet shell
+    TELNET_SESSION_END = "telnet_session_end"
+    REDIS_COMMAND    = "redis_command"       # parsed RESP command to fake redis
+    DOCKER_API       = "docker_api"          # request to fake Docker Engine API
+    DOCKER_CONTAINER_CREATE = "docker_container_create"  # parsed container-create payload
     HEARTBEAT        = "heartbeat"
     NODE_START       = "node_start"
 

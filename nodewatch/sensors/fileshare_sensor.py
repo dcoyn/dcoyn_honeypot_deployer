@@ -42,6 +42,8 @@ import uuid
 import zipfile
 import io
 import secrets
+import threading
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Callable
@@ -53,6 +55,9 @@ from ..core import logger as L
 from ..core.logger import EventType
 from ..core.session import TRACKER
 from ..core.enrichment import enrich
+from ..core import threat_intel as TI
+from ..core import classify as CLS
+from ..core import canary as CANARY
 from .fake_world import FakeWorld
 from .fake_fs import FakeFS, DEFAULT_CANARY_BASE
 
@@ -71,19 +76,74 @@ _PNG_1X1 = base64.b64decode(
     b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lE"
     b"QVR42mP8/x8AAusB9bdfQOEAAAAASUVORK5CYII=")
 
+# Beacon path:  /[b/]<agent>/<download_id>/[<slot>.]<token>.<ext>
+# The optional <slot> tells us WHICH embedded beacon fired (image on open,
+# attached-template on render, hyperlink on a deliberate click), so we can
+# gauge how far the attacker engaged with the document.
 _BEACON_PATH_RE = re.compile(
     r"^/(?:b/)?(?P<agent>[A-Za-z0-9._-]{1,64})/"
     r"(?P<download_id>[A-Za-z0-9._-]{4,64})/"
+    r"(?:(?P<slot>img|tmpl|lnk|xref|wd)\.)?"
     r"(?P<token>[A-Za-z0-9._-]{4,64})"
     r"\.(?P<ext>png|gif|jpg|jpeg|ico|webp|svg)$"
 )
 
-_OFFICE_VER_RE  = re.compile(r"microsoft\s*office/?\s*(\d+(?:\.\d+)?)", re.I)
+# WebDAV/NTLM-eliciting beacon path. When Word fetches an external template
+# from here we answer 401 WWW-Authenticate: NTLM to make the Windows WebClient
+# hand us its NTLMSSP messages (cleartext domain/user/host + a crackable hash).
+_DAV_PATH_RE = re.compile(
+    r"^/(?:dav|wd)/(?P<agent>[A-Za-z0-9._-]{1,64})/"
+    r"(?P<download_id>[A-Za-z0-9._-]{4,64})/"
+    r"(?P<token>[A-Za-z0-9._-]{4,64})(?:\.(?:dotx|dotm|docx|xlsx|xlsm|xml))?$"
+)
+
+# In-memory registry binding a download_id to WHO downloaded the bait file and
+# WHEN, so a later beacon can be correlated back to the exfiltration. Bounded
+# LRU; correlation is best-effort (survives process lifetime, not restarts).
+_DL_REGISTRY: "OrderedDict[str, dict]" = None  # set in module init below
+_DL_LOCK = None
+_DL_MAX = 50_000
+
+_DL_REGISTRY = OrderedDict()
+_DL_LOCK = threading.Lock()
+
+
+def _register_download(download_id: str, ip: str, session: str,
+                       file: str, user_agent: str = "") -> None:
+    """Record who downloaded a bait file so a later beacon can be correlated."""
+    try:
+        with _DL_LOCK:
+            _DL_REGISTRY[download_id] = {
+                "downloader_ip":      ip,
+                "downloader_session": session,
+                "downloaded_file":    file,
+                "downloaded_at":      time.time(),
+                "downloader_ua":      user_agent[:300],
+            }
+            _DL_REGISTRY.move_to_end(download_id)
+            while len(_DL_REGISTRY) > _DL_MAX:
+                _DL_REGISTRY.popitem(last=False)
+    except Exception:
+        pass
+
+
+def _lookup_download(download_id: str) -> dict:
+    """Return the recorded download context for a beacon's id (best-effort)."""
+    try:
+        with _DL_LOCK:
+            return dict(_DL_REGISTRY.get(download_id) or {})
+    except Exception:
+        return {}
+
+_OFFICE_VER_RE  = re.compile(r"(?:microsoft\s*office|word|excel|powerpoint)[/\s]+(\d+\.\d+(?:\.\d+)?)", re.I)
 _OFFICE_APP_RE  = re.compile(r"\b(word|excel|powerpoint|outlook|onenote|access|visio)\b", re.I)
 _LIBRE_VER_RE   = re.compile(r"libreoffice/?\s*(\d+(?:\.\d+)?)", re.I)
 _WIN_NT_RE      = re.compile(r"windows nt (\d+\.\d+)", re.I)
 _MACOS_RE       = re.compile(r"mac os x (\d+[._]\d+(?:[._]\d+)?)", re.I)
 _ANDROID_RE     = re.compile(r"android\s+(\d+(?:\.\d+)?)", re.I)
+# Windows WebDAV mini-redirector leaks the exact OS build in its UA, e.g.
+# "Microsoft-WebDAV-MiniRedir/10.0.19045" → Windows 10 build 19045.
+_WEBDAV_RE      = re.compile(r"microsoft-webdav-miniredir/(\d+\.\d+\.\d+)", re.I)
 
 _WIN_NT_MAP = {
     "10.0": "Windows 10 / 11",
@@ -110,6 +170,12 @@ def _parse_canary_metadata(headers: dict) -> dict:
                              for k, v in headers.items()},
     }
     ua_low = ua.lower()
+
+    # ---- WebDAV mini-redirector: leaks exact Windows build ----
+    if m := _WEBDAV_RE.search(ua_low):
+        out["opener_os"]        = "Windows"
+        out["opener_os_build"]  = m.group(1)
+        out["opener_app_family"] = "Windows WebDAV client (mini-redirector)"
 
     # ---- OS detection ----
     if m := _WIN_NT_RE.search(ua_low):
@@ -243,20 +309,25 @@ def _log_request(event_type: str, extra: Optional[dict] = None) -> None:
         body_b64 = base64.b64encode(raw[:8192]).decode()
     except Exception:
         pass
+    ua = request.headers.get("User-Agent", "")
+    geo = enrich(src_ip)
     data = {
         "method":      request.method,
         "path":        request.path,
         "query":       request.query_string.decode("latin-1"),
         "host":        request.host,
         "scheme":      request.scheme,
-        "user_agent":  request.headers.get("User-Agent", ""),
+        "user_agent":  ua,
         "referer":     request.headers.get("Referer", ""),
         "accept_lang": request.headers.get("Accept-Language", ""),
         "headers":     headers,
         "cookies":     {k: v[:512] for k, v in request.cookies.items()},
         "body_len":    body_len,
         "body_b64":    body_b64,
-        "geo":         enrich(src_ip),
+        "geo":         geo,
+        "intel":       TI.tag_event(src_ip, geo, user_agent=ua),
+        "classification": CLS.classify_http(
+            request.path, request.query_string.decode("latin-1"), ua),
     }
     if extra:
         data.update(extra)
@@ -274,28 +345,144 @@ def _log_request(event_type: str, extra: Optional[dict] = None) -> None:
 def _trace():
     request.environ["_HP_T0"] = time.monotonic()
 
-    # Canary beacon URL? (Document fetched by Word/Excel/LibreOffice on
-    # attacker's machine when they OPEN the bait file we let them exfil.
-    # We get the opener's UA, locale, headers — sometimes a different IP
-    # than the original downloader, which is hugely valuable for attribution.)
+    # WebDAV / NTLM-eliciting beacon (Word fetching an external template). We
+    # answer 401 WWW-Authenticate: NTLM to make the Windows WebClient hand us
+    # its NTLMSSP messages — cleartext domain/user/host + a crackable hash.
+    dav = _DAV_PATH_RE.match(request.path)
+    if dav:
+        return _handle_dav_beacon(dav)
+
+    # Image/template/hyperlink beacon — fired when the bait doc is opened.
     m = _BEACON_PATH_RE.match(request.path)
     if m:
-        parsed = _parse_canary_metadata({k: v for k, v in request.headers.items()})
-        _log_request(EventType.HTTP_REQUEST, {
-            "canary_event":         "canary_beacon_received",
-            "canary_agent":          m.group("agent"),
-            "canary_download_id":    m.group("download_id"),
-            "canary_token":          m.group("token"),
-            "canary_beacon_ext":     m.group("ext"),
-            **parsed,
-        })
-        return make_response(_PNG_1X1, 200, {
-            "Content-Type":  "image/png",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Server":        "Apache/2.4.41 (Ubuntu)",
-        })
+        return _handle_canary_beacon(m)
 
     _log_request(EventType.HTTP_REQUEST)
+
+
+# A few slot labels → human-readable engagement meaning.
+_SLOT_MEANING = {
+    "img":  "external image rendered (document opened in a viewer)",
+    "tmpl": "external template fetched (Word processed the document)",
+    "lnk":  "embedded hyperlink clicked (deliberate human interaction)",
+    "xref": "external workbook link updated (Excel 'enable content')",
+    "wd":   "WebDAV/template reference resolved",
+}
+
+
+def _beacon_intel(m, *, slot: Optional[str], extra: Optional[dict] = None) -> dict:
+    """Assemble the enriched intel payload shared by all beacon handlers."""
+    opener_ip = _client_ip()
+    headers = {k: v for k, v in request.headers.items()}
+    parsed = _parse_canary_metadata(headers)
+
+    # ---- correlate back to the exfiltration ----
+    dl = _lookup_download(m.group("download_id"))
+    secs_since = None
+    if dl.get("downloaded_at"):
+        secs_since = round(time.time() - dl["downloaded_at"], 1)
+
+    # ---- proxy unmasking + opener geo/threat-intel ----
+    geo = enrich(opener_ip)
+    proxy = CANARY.extract_proxy_chain(headers, peer_ip=opener_ip)
+    intel = TI.tag_event(opener_ip, geo, user_agent=parsed.get("user_agent", ""))
+    opener_infra = (intel.get("source") or {}).get("infra")
+
+    # ---- Office patch-level inference ----
+    office = CANARY.infer_office_channel(parsed.get("opener_app_version"))
+
+    # ---- human vs automated detonation ----
+    opener = CANARY.classify_opener(
+        user_agent=parsed.get("user_agent", ""),
+        accept_language=parsed.get("accept_language", ""),
+        seconds_since_download=secs_since,
+        opener_infra=opener_infra,
+        method=request.method,
+        range_request=bool(request.headers.get("Range")),
+    )
+
+    data = {
+        "canary_event":         "canary_beacon_received",
+        "canary_agent":          m.group("agent"),
+        "canary_download_id":    m.group("download_id"),
+        "canary_token":          m.group("token"),
+        "canary_slot":           slot,
+        "canary_slot_meaning":   _SLOT_MEANING.get(slot or "", None),
+        "opener_ip":             opener_ip,
+        "opener_geo":            geo,
+        "opener_intel":          intel,
+        **office,
+        **opener,
+        **parsed,
+    }
+    if proxy:
+        data["opener_proxy"] = proxy
+    if dl:
+        data["downloader_ip"]            = dl.get("downloader_ip")
+        data["downloader_session"]       = dl.get("downloader_session")
+        data["downloaded_file"]          = dl.get("downloaded_file")
+        data["download_to_open_seconds"] = secs_since
+        data["opener_is_different_ip"]   = (
+            dl.get("downloader_ip") and dl["downloader_ip"] != opener_ip)
+        # If the opener came from a different network than the downloader,
+        # that's a strong attribution signal worth flagging loudly.
+        if data["opener_is_different_ip"]:
+            data["attribution_note"] = (
+                "opened from a different IP than the downloader — "
+                "likely the attacker's real machine behind the staging box")
+    if extra:
+        data.update(extra)
+    return data
+
+
+def _handle_canary_beacon(m):
+    slot = m.group("slot")
+    data = _beacon_intel(m, slot=slot)
+    _log_request(EventType.HTTP_REQUEST, data)
+    return make_response(_PNG_1X1, 200, {
+        "Content-Type":  "image/png",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Server":        "Apache/2.4.41 (Ubuntu)",
+    })
+
+
+def _handle_dav_beacon(m):
+    """401→challenge→capture NTLM handshake for the WebDAV template beacon."""
+    auth = request.headers.get("Authorization", "")
+    ntlm = CANARY.parse_ntlm_authorization(auth) if auth else {}
+
+    # Step 1: no/blank auth → demand NTLM (also offer Negotiate for breadth).
+    if not ntlm:
+        resp = make_response("", 401)
+        resp.headers["WWW-Authenticate"] = "NTLM"
+        resp.headers["Server"] = "Microsoft-IIS/10.0"
+        # Log the bare WebDAV probe (Windows WebClient reached out at all).
+        _log_request(EventType.HTTP_REQUEST,
+                     _beacon_intel(m, slot="wd",
+                                   extra={"canary_event": "canary_webdav_probe"}))
+        return resp
+
+    # Step 2: client sent NTLMSSP Type 1 → reply with our Type 2 challenge.
+    if ntlm.get("ntlm_message_type") == 1:
+        resp = make_response("", 401)
+        resp.headers["WWW-Authenticate"] = "NTLM " + CANARY.build_ntlm_challenge(
+            target_name=(ntlm.get("domain") or "WORKGROUP"))
+        resp.headers["Server"] = "Microsoft-IIS/10.0"
+        _log_request(EventType.HTTP_REQUEST,
+                     _beacon_intel(m, slot="wd",
+                                   extra={"canary_event": "canary_ntlm_negotiate",
+                                          **{f"ntlm_{k}": v for k, v in ntlm.items()
+                                             if k not in ("ntlm_message_type",)}}))
+        return resp
+
+    # Step 3: client sent NTLMSSP Type 3 → CREDENTIAL CAPTURE.
+    data = _beacon_intel(m, slot="wd", extra={
+        "canary_event": "canary_ntlm_credentials_captured",
+        **ntlm,
+    })
+    _log_request(EventType.HTTP_REQUEST, data)
+    # Pretend the resource just isn't there now — the auth already paid off.
+    return make_response("Not Found", 404, {"Server": "Microsoft-IIS/10.0"})
 
 
 @app.after_request
@@ -640,8 +827,12 @@ class FileShare:
     # ---------- HTML canary builder ----------
     def _build_html_canary(self, download_id: str) -> bytes:
         token = secrets.token_urlsafe(12)
-        beacon = (f"{self.canary_base}/{self.agent}/{download_id}/{token}.png"
-                   if self.canary_base else f"about:blank#{token}")
+        base = self.canary_base
+        if base:
+            beacon_img = f"{base}/{self.agent}/{download_id}/img.{token}.png"
+            beacon_lnk = f"{base}/{self.agent}/{download_id}/lnk.{token}.png"
+        else:
+            beacon_img = beacon_lnk = f"about:blank#{token}"
         v = self.v
         body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -680,9 +871,11 @@ class FileShare:
   <h2>Notes</h2>
   <p>Stripe webhook secret rotated: <code>whsec_{html.escape(v['stripe_whsec'][:16])}…</code></p>
   <p>Admin API token (do not commit): <code>{html.escape(v['admin_token'][:20])}…</code></p>
+  <p>Full credentials archive:
+     <a href="{html.escape(beacon_lnk)}">vault-export-full.zip</a> (click to download)</p>
 
   <p style="margin-top:2em; color:#888; font-size:0.85em;">
-    <img src="{html.escape(beacon)}" width="1" height="1" alt="" />
+    <img src="{html.escape(beacon_img)}" width="1" height="1" alt="" />
     Document ID: {html.escape(download_id)}
   </p>
 </body>
@@ -799,6 +992,10 @@ def _serve_file(share: FileShare, path: str):
     download_id = str(uuid.uuid4())
 
     if share.is_canary(path):
+        # Remember who pulled this file so a later beacon can be tied back to
+        # this exact download (downloader IP vs opener IP = attribution gold).
+        _register_download(download_id, _client_ip(), TRACKER.get(_client_ip()),
+                            path, request.headers.get("User-Agent", ""))
         # Log a stronger event so the operator can correlate beacon hits back here
         _log_request(EventType.HTTP_REQUEST, {
             "canary_event": "canary_file_downloaded",
@@ -1210,14 +1407,16 @@ def serve(host: str = "0.0.0.0", http_port: int = 80, https_port: int = 443) -> 
 
     def _run_http():
         from werkzeug.serving import make_server
-        s = make_server(host, http_port, app, threaded=True)
+        from ..core.http_stealth import StealthWSGIRequestHandler
+        s = make_server(host, http_port, app, threaded=True, request_handler=StealthWSGIRequestHandler)
         s.serve_forever()
 
     def _run_https():
         from werkzeug.serving import make_server
+        from ..core.http_stealth import StealthWSGIRequestHandler
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(certfile=str(cert), keyfile=str(key))
-        s = make_server(host, https_port, app, threaded=True, ssl_context=ctx)
+        s = make_server(host, https_port, app, threaded=True, ssl_context=ctx, request_handler=StealthWSGIRequestHandler)
         s.serve_forever()
 
     t1 = threading.Thread(target=_run_http,  daemon=True)

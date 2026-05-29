@@ -44,6 +44,7 @@ from ..core import logger as L
 from ..core.logger import EventType
 from ..core.session import TRACKER
 from ..core.enrichment import enrich
+from ..core import threat_intel as TI
 
 READ_BUDGET = 8192   # bytes we will accept per connection
 READ_TIMEOUT = 5.0
@@ -149,11 +150,13 @@ class _PortHandler(socketserver.BaseRequestHandler):
         src_ip, src_port = self.client_address[0], self.client_address[1]
         sid = TRACKER.get(src_ip)
 
+        geo = enrich(src_ip)
         L.get().emit(
             EventType.WIN_PROBE,
             src_ip=src_ip, src_port=src_port, dst_port=self.dst_port,
             session_id=sid,
-            data={"service": self.label, "geo": enrich(src_ip)},
+            data={"service": self.label, "geo": geo,
+                  "intel": TI.tag_event(src_ip, geo)},
         )
 
         sock.settimeout(READ_TIMEOUT)

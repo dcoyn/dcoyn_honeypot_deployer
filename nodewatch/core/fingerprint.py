@@ -224,3 +224,128 @@ def fingerprint(record: bytes) -> Optional[dict]:
         "alpn":      parsed["alpn"],
         "tls_versions": parsed["supported_versions"] or [parsed["tls_version"]],
     }
+
+
+# ============================================================================
+# HASSH — the SSH equivalent of JA3
+# ============================================================================
+# HASSH fingerprints an SSH *client* (HASSHServer fingerprints a server) from
+# the algorithm lists it offers in its SSH_MSG_KEXINIT packet. Two clients that
+# offer the same kex / encryption / MAC / compression algorithms in the same
+# order hash to the same HASSH — so the same brute-force tool, worm, or library
+# is recognizable across IPs even when the version banner is spoofed.
+#
+#   hassh        = md5( kex ; ciphers ; macs ; compression )   [client->server]
+#   hasshServer  = md5( kex ; ciphers ; macs ; compression )   [server->client]
+#
+# Reference: https://github.com/salesforce/hassh
+#
+# We parse the binary SSH KEXINIT ourselves so there is no extra dependency and
+# it works from the passive sniffer's reassembled TCP stream.
+
+_SSH_MSG_KEXINIT = 20
+
+
+def parse_ssh_kexinit(stream: bytes) -> Optional[dict]:
+    """Locate and parse an SSH_MSG_KEXINIT inside a reassembled TCP stream.
+
+    The stream may begin with the ASCII version banner ("SSH-2.0-...\\r\\n")
+    followed by one or more binary packets. We skip the banner, then walk
+    binary packets looking for message type 20 (KEXINIT). Returns the offered
+    name-lists, or ``None`` if no parseable KEXINIT is present yet.
+    """
+    try:
+        if not stream:
+            return None
+
+        i = 0
+        # Skip an optional identification string line(s) ("SSH-2.0-..." CRLF).
+        # Pre-banner comment lines are allowed by RFC 4253 but rare; handle the
+        # common single-banner case and any leading lines that aren't binary.
+        while stream[i:i+4] == b"SSH-" or (i < len(stream) and stream[i] in (0x0d, 0x0a)):
+            nl = stream.find(b"\n", i)
+            if nl == -1:
+                return None
+            i = nl + 1
+            if i >= len(stream):
+                return None
+
+        # Walk binary packets: uint32 packet_length, byte padding_length, payload
+        while i + 5 <= len(stream):
+            pkt_len = struct.unpack_from(">I", stream, i)[0]
+            if pkt_len < 2 or pkt_len > 35000:
+                return None  # not a sane SSH packet boundary
+            if i + 4 + pkt_len > len(stream):
+                return None  # need more bytes (handshake not fully reassembled)
+            pad_len = stream[i + 4]
+            payload = stream[i + 5 : i + 4 + pkt_len - pad_len]
+            i = i + 4 + pkt_len
+
+            if not payload:
+                continue
+            if payload[0] != _SSH_MSG_KEXINIT:
+                continue  # some other packet; keep scanning
+
+            # KEXINIT body: msg(1) + cookie(16) + 10 name-lists + first_kex(1) + reserved(4)
+            j = 1 + 16
+            names: List[List[str]] = []
+            for _ in range(10):
+                if j + 4 > len(payload):
+                    return None
+                ln = struct.unpack_from(">I", payload, j)[0]
+                j += 4
+                raw = payload[j:j + ln]
+                j += ln
+                names.append(raw.decode("ascii", "replace").split(",") if raw else [])
+
+            return {
+                "kex":              names[0],
+                "server_host_key":  names[1],
+                "enc_c2s":          names[2],
+                "enc_s2c":          names[3],
+                "mac_c2s":          names[4],
+                "mac_s2c":          names[5],
+                "cmp_c2s":          names[6],
+                "cmp_s2c":          names[7],
+                "lang_c2s":         names[8],
+                "lang_s2c":         names[9],
+            }
+        return None
+    except Exception:
+        return None
+
+
+def compute_hassh(parsed: dict, server: bool = False) -> Tuple[str, str]:
+    """Compute (hassh_algorithms_string, md5) from a parsed KEXINIT.
+
+    ``server=False`` -> client HASSH (uses c2s lists);
+    ``server=True``  -> server HASSH (uses s2c lists).
+    """
+    if server:
+        enc, mac, cmp = parsed["enc_s2c"], parsed["mac_s2c"], parsed["cmp_s2c"]
+    else:
+        enc, mac, cmp = parsed["enc_c2s"], parsed["mac_c2s"], parsed["cmp_c2s"]
+    algos = ";".join([
+        ",".join(parsed["kex"]),
+        ",".join(enc),
+        ",".join(mac),
+        ",".join(cmp),
+    ])
+    return algos, hashlib.md5(algos.encode()).hexdigest()
+
+
+def ssh_fingerprint(stream: bytes) -> Optional[dict]:
+    """Parse a reassembled SSH stream and return a HASSH client fingerprint."""
+    parsed = parse_ssh_kexinit(stream)
+    if not parsed:
+        return None
+    algos, md5 = compute_hassh(parsed, server=False)
+    return {
+        "hassh":            md5,
+        "hassh_algorithms": algos,
+        "kex":              parsed["kex"],
+        "ciphers":          parsed["enc_c2s"],
+        "macs":             parsed["mac_c2s"],
+        "compression":      parsed["cmp_c2s"],
+        "server_host_key_algos": parsed["server_host_key"],
+    }

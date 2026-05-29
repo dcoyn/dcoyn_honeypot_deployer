@@ -39,6 +39,8 @@ from ..config import Config
 from ..core import logger as L
 from ..core.logger import EventType
 from ..core.enrichment import enrich
+from ..core import threat_intel as TI
+from ..core import classify as CLS
 from .fake_fs import FakeFS, DEFAULT_CANARY_BASE
 from .fake_world import FakeWorld
 from .fake_system import FakeSystem, render_proc_path
@@ -151,7 +153,8 @@ class _SensorServer(paramiko.ServerInterface):
             EventType.SSH_COMMAND,
             src_ip=self.src_ip, src_port=self.src_port, dst_port=LISTEN_PORT,
             session_id=self.session_id,
-            data={"command": cmd, "mode": "exec"},
+            data={"command": cmd, "mode": "exec",
+                  "classification": CLS.classify_command(cmd)},
         )
         with self._exec_lock:
             self._exec_for_chan[channel.get_id()] = cmd
@@ -881,7 +884,7 @@ class _Handler(socketserver.BaseRequestHandler):
             EventType.CONNECTION,
             src_ip=src_ip, src_port=src_port, dst_port=LISTEN_PORT,
             session_id=session_id,
-            data={"service": "ssh", "geo": ge},
+            data={"service": "ssh", "geo": ge, "intel": TI.tag_event(src_ip, ge)},
         )
 
         transport = paramiko.Transport(sock)
@@ -914,7 +917,8 @@ class _Handler(socketserver.BaseRequestHandler):
             EventType.SSH_BANNER,
             src_ip=src_ip, src_port=src_port, dst_port=LISTEN_PORT,
             session_id=session_id,
-            data={"remote_version": transport.remote_version},
+            data={"remote_version": transport.remote_version,
+                  "intel": {"ssh_client": TI.classify_ssh_client(transport.remote_version)}},
         )
 
         # Accept channels in a loop — a single SSH session can multiplex several
@@ -1022,7 +1026,8 @@ class _Handler(socketserver.BaseRequestHandler):
                         src_ip=server.src_ip, src_port=server.src_port, dst_port=LISTEN_PORT,
                         session_id=server.session_id,
                         data={"command": cmd, "mode": "shell", "seq": cmd_count,
-                              "cwd": state.cwd},
+                              "cwd": state.cwd,
+                              "classification": CLS.classify_command(cmd)},
                     )
                     out = _exec(state, cmd)
                     if out == "__EXIT__":

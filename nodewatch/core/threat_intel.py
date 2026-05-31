@@ -101,20 +101,58 @@ _RESIDENTIAL_KEYWORDS = (
 )
 
 
+# Known internet-wide research scanners — identified by PTR or AS org. These
+# run continuous background scans and are mostly benign; flagging them lets an
+# analyst filter the noise and focus on genuine adversary activity.
+_SCANNER_SIGNATURES = [
+    (re.compile(r"censys"),                          "Censys"),
+    (re.compile(r"shodan|census\d|\bclient\.shodan"), "Shodan"),
+    (re.compile(r"shadowserver"),                    "Shadowserver Foundation"),
+    (re.compile(r"binaryedge"),                       "BinaryEdge"),
+    (re.compile(r"stretchoid"),                       "Stretchoid"),
+    (re.compile(r"internet-measurement\.com|driftnet"), "Driftnet/internet-measurement"),
+    (re.compile(r"rapid7|sonar\.labs|projectsonar"), "Rapid7 Project Sonar"),
+    (re.compile(r"leakix"),                           "LeakIX"),
+    (re.compile(r"onyphe"),                           "Onyphe"),
+    (re.compile(r"expanse|palo alto networks.*expan"), "Palo Alto Expanse"),
+    (re.compile(r"criminalip|aiscan|security\.ipip"), "CriminalIP"),
+    (re.compile(r"netsystemsresearch"),               "NetSystemsResearch"),
+    (re.compile(r"alphastrike|alpha strike"),         "Alpha Strike Labs"),
+    (re.compile(r"bufferover|tenable|qualys.*cloud"), "vuln-mgmt scanner"),
+    (re.compile(r"academic|university|\buni-\b|researchscan|cspr\.io"), "academic scanner"),
+    (re.compile(r"gdnplus|cyber\s?resilience|recyber"), "recyber/gdnplus"),
+]
+
+
 def classify_source(ip: str, geo: Optional[dict]) -> dict:
     """Return source-infrastructure intel for an IP.
 
     Output keys (all optional):
-        infra        "cloud" | "hosting" | "vpn" | "tor" | "residential" | None
-        provider     normalized provider slug when known (e.g. "aws")
-        as_org       echoed AS org for convenience
-        asn          echoed ASN
+        infra         "cloud" | "hosting" | "vpn" | "tor" | "residential" | None
+        provider      normalized provider slug when known (e.g. "aws")
+        as_org        echoed AS org for convenience
+        asn           echoed ASN
+        is_scanner    True if this looks like a benign internet-wide research
+                      scanner (Censys/Shodan/Shadowserver/...) — lets the
+                      aggregator separate background noise from real attackers
+        scanner       the scanner's name when known
     """
     out: dict = {"infra": None, "provider": None}
     geo = geo or {}
     as_org = (geo.get("as_org") or "").strip()
+    ptr = (geo.get("ptr") or "").strip().lower()
     out["asn"] = geo.get("asn")
     out["as_org"] = as_org or None
+
+    # Research-scanner overlay (independent of infra). Identified by PTR or AS
+    # org; these run continuous internet-wide scans and are mostly benign noise.
+    hay = f"{ptr} {as_org.lower()}"
+    for rx, name in _SCANNER_SIGNATURES:
+        if rx.search(hay):
+            out["is_scanner"] = True
+            out["scanner"] = name
+            break
+
     if not as_org:
         return out
 
@@ -255,7 +293,7 @@ def tag_event(ip: str,
     intel: dict = {}
     try:
         src = classify_source(ip, geo)
-        if src.get("infra") or src.get("provider"):
+        if src.get("infra") or src.get("provider") or src.get("is_scanner"):
             intel["source"] = src
         if ssh_banner is not None:
             c = classify_ssh_client(ssh_banner)

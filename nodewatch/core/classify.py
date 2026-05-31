@@ -30,10 +30,14 @@ _URL_RE  = re.compile(r"\bhttps?://[^\s'\"|;>)]+", re.IGNORECASE)
 _IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 # wget/curl http://x/y -O name  /  ">name"  /  "mv x name"
 _OUTFILE_RE = re.compile(r"(?:-O|-o|>>?)\s*([\w./\-]+)")
+# SSH public keys an attacker pastes into authorized_keys (reusable IOC).
+_SSHKEY_RE = re.compile(
+    r"(?:ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp\d+)\s+[A-Za-z0-9+/]{60,}={0,2}(?:\s+\S+)?")
 
 
 def extract_iocs(text: str) -> dict:
-    """Pull URLs, IPv4 addresses, and likely dropped-file names from a string."""
+    """Pull URLs, IPv4 addresses, likely dropped-file names, and any SSH public
+    keys an attacker tries to install (a strong, reusable attacker IOC)."""
     out: dict = {}
     if not text:
         return out
@@ -48,6 +52,10 @@ def extract_iocs(text: str) -> dict:
     files = [f for f in _OUTFILE_RE.findall(text) if "/" in f or "." in f]
     if files:
         out["dropped_files"] = sorted(set(files))[:20]
+    keys = _SSHKEY_RE.findall(text)
+    if keys:
+        # Normalize to "type base64[ comment]" and cap length.
+        out["ssh_keys"] = sorted({k.strip()[:600] for k in keys})[:8]
     return out
 
 

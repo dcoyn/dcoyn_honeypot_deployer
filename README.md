@@ -284,6 +284,40 @@ The aggregator rolls these up per IP into an attacker scorecard:
 `attack_techniques` (ATT&CK), `attack_categories` (counts), `ioc_ips`,
 `ioc_urls`, `redis_attack_chains`, and `botnet_probe`.
 
+### Attacker profile (derived verdict)
+
+On top of the raw signals, each IP profile carries a derived verdict so an
+analyst can sort and triage at a glance:
+
+- **`actor_type`** — one of `research_scanner`, `ransomware_operator`,
+  `cryptojacker`, `credential_harvester`, `container_escape_operator`,
+  `iot_botnet`, `interactive_operator`, `credential_bruteforcer`,
+  `automated_scanner`, `prober`.
+- **`threat_score`** — 0-100, weighting destructive TTPs (ransomware, credential
+  dumping, container escape), credential success, hands-on-keyboard activity and
+  infra type. Benign internet-wide scanners are capped low.
+- **`profile_tags`** — e.g. `ransomware-ttp`, `credential-dumping`,
+  `cryptojacking`, `persistence`, `captured-domain-creds`, `multi-service`.
+- **`is_known_scanner` / `scanner_name`** — flags benign research scanners
+  (Censys, Shodan, Shadowserver, BinaryEdge, Rapid7, …) so they don't pollute
+  the real-attacker view.
+
+Plus the supporting evidence behind the verdict:
+
+- **Credential corpus** — `usernames_tried`, `passwords_tried` (the actual
+  wordlist they used, across SSH/RDP/ESXi/OWA/telnet), with `cred_attempts` /
+  `cred_successes`.
+- **Behavioural / temporal** — `active_hours_utc`, `active_window_utc` (operator
+  timezone hint), `active_days`, `first_seen` / `last_seen`, `sessions`.
+- **Captured artifacts** — `captured_ssh_keys` (a key the attacker installed —
+  a reusable cross-victim IOC), `captured_credentials` / `captured_netntlmv2`
+  (from canaries), `decoded_powershell`, `crypto_wallets`, `mining_pools`,
+  `docker_images`.
+- **Network attribution** — `asn`, `as_org`, `rdns`, `country`, `ports_hit`,
+  `sensors` (which honeypot types this IP touched — multi-service = coordinated).
+- **Per-OS command corpus** — `esxi_commands`, `windows_commands` (exactly what
+  was typed in the fake shells).
+
 ## Repository layout
 
 ```

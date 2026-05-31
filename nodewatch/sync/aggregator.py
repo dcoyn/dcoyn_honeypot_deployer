@@ -68,6 +68,94 @@ def _load_json(path: Path, default):
         return default
 
 
+def _profile_actor(p: dict) -> None:
+    """Derive a human-readable actor classification and a 0-100 threat score
+    from a fully-merged IP profile, plus a set of profile tags and an active-
+    window hint. Pure function of the data already collected; never throws.
+
+    This turns the raw signal soup into a one-line verdict an analyst can sort
+    and triage on: *what kind of attacker is this, and how much should I care.*
+    """
+    try:
+        techs = set(p.get("attack_techniques", []) or [])
+        cats = p.get("attack_categories", {}) or {}
+        tags: list[str] = []
+
+        def has(*t):
+            return any(x in techs for x in t)
+
+        interactive = (p.get("commands_run", 0) or 0) > 0
+        imgs = p.get("docker_images", []) or []
+        ransomware = (has("T1486", "T1490")
+                      or (has("T1489") and (p.get("esxi_targeted") or p.get("esxi_commands")))
+                      or "data_encrypted_for_impact" in cats
+                      or "inhibit_system_recovery" in cats)
+        cryptojack = (has("T1496") or p.get("mining_pools") or p.get("crypto_wallets")
+                      or any(("miner" in i or "xmrig" in i or "kinsing" in i) for i in imgs))
+        creddump = has("T1003") or "credential_dumping" in cats
+        escape = bool(p.get("docker_host_escape_attempt")) or has("T1611")
+        persistence = has("T1098.004", "T1136.001", "T1053.003") or bool(p.get("captured_ssh_keys"))
+        bruteforce = (p.get("cred_attempts", 0) or 0) >= 5 and not interactive
+        botnet = bool(p.get("botnet_probe"))
+        scanner = bool(p.get("is_known_scanner"))
+
+        if scanner and not (p.get("cred_successes") or interactive or ransomware or cryptojack):
+            actor = "research_scanner"
+        elif ransomware:
+            actor = "ransomware_operator"
+        elif cryptojack:
+            actor = "cryptojacker"
+        elif creddump:
+            actor = "credential_harvester"
+        elif escape:
+            actor = "container_escape_operator"
+        elif botnet:
+            actor = "iot_botnet"
+        elif interactive:
+            actor = "interactive_operator"
+        elif bruteforce:
+            actor = "credential_bruteforcer"
+        elif p.get("automated"):
+            actor = "automated_scanner"
+        else:
+            actor = "prober"
+
+        score = 0
+        if not scanner:
+            score += {"tor": 12, "vpn": 8, "hosting": 6, "cloud": 6,
+                      "residential": 2}.get(p.get("infra"), 3)
+        score += min(p.get("cred_attempts", 0) or 0, 20)
+        score += 12 * min(p.get("cred_successes", 0) or 0, 2)
+        score += min((p.get("commands_run", 0) or 0) * 2, 20)
+        if ransomware:   score += 45; tags.append("ransomware-ttp")
+        if creddump:     score += 25; tags.append("credential-dumping")
+        if escape:       score += 20; tags.append("container-escape")
+        if cryptojack:   score += 20; tags.append("cryptojacking")
+        if persistence:  score += 12; tags.append("persistence")
+        if p.get("captured_credentials"): score += 15; tags.append("captured-domain-creds")
+        if p.get("opened_canary"):        score += 12; tags.append("opened-canary")
+        if p.get("deployed_container"):   tags.append("deployed-container")
+        if botnet:       score += 10; tags.append("iot-botnet")
+        if len(p.get("sensors", []) or []) > 1 or len(p.get("ports_hit", []) or []) >= 4:
+            score += 6; tags.append("multi-service")
+        if p.get("automated"):
+            tags.append("automated")
+        if scanner:
+            score = min(score, 10)
+            tags.append(f"known-scanner:{p.get('scanner_name', '?')}")
+
+        hrs = sorted(p.get("active_hours_utc", []) or [])
+        if hrs:
+            p["active_window_utc"] = f"{min(hrs):02d}:00-{max(hrs):02d}:59"
+
+        p["actor_type"] = actor
+        p["threat_score"] = max(0, min(100, score))
+        if tags:
+            p["profile_tags"] = sorted(set(tags))
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- main
 def run() -> dict:
     cfg = Config.load()
@@ -138,11 +226,29 @@ def run() -> dict:
             ipd["cred_attempts"] = ipd.get("cred_attempts", 0) + 1
             if data.get("accepted") or et == "ssh_login_ok":
                 ipd["cred_successes"] = ipd.get("cred_successes", 0) + 1
+        # Credential corpus — the actual usernames/passwords tried reveal which
+        # wordlist/botnet the attacker is using (and feed cross-IP clustering).
+        if et in ("ssh_auth", "ssh_login_ok", "http_login", "esxi_login", "telnet_auth"):
+            u = data.get("username")
+            p = data.get("password")
+            if u not in (None, ""):
+                ipd.setdefault("usernames_tried", set()).add(str(u)[:128])
+            if p not in (None, ""):
+                ipd.setdefault("passwords_tried", set()).add(str(p)[:128])
+
+        # Temporal profile: which UTC hours / days this IP is active — hints at
+        # the operator's working timezone and whether it's a one-off or persistent.
+        try:
+            ipd.setdefault("active_hours_utc", set()).add(dt.hour)
+            ipd.setdefault("active_days", set()).add(dt.strftime("%Y-%m-%d"))
+        except Exception:
+            pass
 
         # ---- RDP / Terminal Services recon ----
         if et == "rdp_connect":
             if data.get("mstshash_user"):
                 ipd.setdefault("rdp_usernames", set()).add(data["mstshash_user"][:128])
+                ipd.setdefault("usernames_tried", set()).add(data["mstshash_user"][:128])
             for p in data.get("requested_protocols", []):
                 ipd.setdefault("rdp_requested_security", set()).add(p)
         if et == "rdp_client_info" and data.get("client_name"):
@@ -178,6 +284,19 @@ def run() -> dict:
             ipd["infra"] = src_intel["infra"]
         if src_intel.get("provider"):
             ipd["provider"] = src_intel["provider"]
+        if src_intel.get("is_scanner"):
+            ipd["is_known_scanner"] = True
+            if src_intel.get("scanner"):
+                ipd["scanner_name"] = src_intel["scanner"]
+        if src_intel.get("as_org") and not ipd.get("as_org"):
+            ipd["as_org"] = src_intel["as_org"]
+        if src_intel.get("asn") and not ipd.get("asn"):
+            ipd["asn"] = src_intel["asn"]
+        # rDNS + country straight from geo (useful at a glance for attribution)
+        if geo.get("ptr") and not ipd.get("rdns"):
+            ipd["rdns"] = geo["ptr"]
+        if geo.get("country") and not ipd.get("country"):
+            ipd["country"] = geo["country"]
         if intel.get("automated") is True:
             ipd["automated"] = True
         sc = intel.get("ssh_client") or {}
@@ -203,6 +322,8 @@ def run() -> dict:
             ipd.setdefault("ioc_ips", set()).add(ioc_ip)
         for ioc_url in (cl.get("iocs") or {}).get("urls", []):
             ipd.setdefault("ioc_urls", set()).add(ioc_url)
+        for k in (cl.get("iocs") or {}).get("ssh_keys", []):
+            ipd.setdefault("captured_ssh_keys", set()).add(k)
         # Redis attack chains + telnet botnet probes
         if et == "redis_command" and data.get("attack_chain"):
             ipd.setdefault("redis_attack_chains", set()).add(data["attack_chain"])
@@ -297,7 +418,9 @@ def run() -> dict:
                   "docker_attack_chains", "docker_images", "crypto_wallets",
                   "mining_pools", "rdp_usernames", "rdp_requested_security",
                   "rdp_client_names", "esxi_credentials",
-                  "esxi_commands", "windows_commands", "decoded_powershell"):
+                  "esxi_commands", "windows_commands", "decoded_powershell",
+                  "usernames_tried", "passwords_tried", "active_hours_utc",
+                  "active_days", "captured_ssh_keys"):
             if k in upd and isinstance(upd[k], set):
                 upd[k] = sorted(upd[k])
             if k in existing and isinstance(existing[k], list):
@@ -314,10 +437,12 @@ def run() -> dict:
             upd["attack_categories"] = merged
         # sticky boolean flags
         for k in ("automated", "botnet_probe", "opened_canary", "captured_credentials",
-                  "deployed_container", "docker_host_escape_attempt", "esxi_targeted"):
+                  "deployed_container", "docker_host_escape_attempt", "esxi_targeted",
+                  "is_known_scanner"):
             if existing.get(k) or upd.get(k):
                 upd[k] = True
-        for k in ("infra", "provider", "opener_kind"):
+        for k in ("infra", "provider", "opener_kind", "scanner_name",
+                  "as_org", "asn", "rdns", "country"):
             if k not in upd and k in existing:
                 upd[k] = existing[k]
         if "event_types" in upd:
@@ -329,6 +454,7 @@ def run() -> dict:
             upd["first_seen"] = existing["first_seen"]
         if "geo" not in upd and "geo" in existing:
             upd["geo"] = existing["geo"]
+        _profile_actor(upd)
         _atomic_write_json(path, upd)
 
     # Session summaries

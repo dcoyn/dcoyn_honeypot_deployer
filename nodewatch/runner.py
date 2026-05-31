@@ -68,6 +68,16 @@ def _run_with_beacon(sensor_serve) -> int:
     return _watchdog(threads)
 
 
+def _run_threads(named_callables: dict) -> int:
+    """Run several sensor callables, each in its own daemon thread, under the
+    watchdog. If any exits, return non-zero so systemd restarts the service."""
+    threads = {name: threading.Thread(target=fn, daemon=True, name=name)
+               for name, fn in named_callables.items()}
+    for th in threads.values():
+        th.start()
+    return _watchdog(threads)
+
+
 def main() -> int:
     cfg = Config.load()
     t = cfg.sensor_profile
@@ -80,8 +90,14 @@ def main() -> int:
         beacon.install_beacon_intercept(owa_sensor.app)
         owa_sensor.serve()
     elif t == "winserver":
-        from .sensors import win_sensor
-        return _run_with_beacon(win_sensor.serve)
+        # Windows ports (win_sensor) + a cmd/PowerShell shell over OpenSSH (22,
+        # the realistic text channel for capturing Windows commands) + beacon.
+        from .sensors import win_sensor, win_shell, ssh_shell_base, beacon
+        return _run_threads({
+            "winserver": win_sensor.serve,
+            "win_ssh":   lambda: ssh_shell_base.run(win_shell.WinPersonality()),
+            "beacon":    beacon.serve,
+        })
     elif t == "telnet":
         from .sensors import telnet_sensor
         return _run_with_beacon(telnet_sensor.serve)
@@ -91,6 +107,19 @@ def main() -> int:
     elif t == "docker":
         from .sensors import docker_sensor
         return _run_with_beacon(docker_sensor.serve)
+    elif t == "rdp":
+        from .sensors import rdp_sensor
+        return _run_with_beacon(rdp_sensor.serve)
+    elif t == "esxi":
+        # ESXi HTTPS API on 443 (beacon intercept on its app) + the ESXi shell
+        # over SSH on 22 (esxcli/vim-cmd) + the standalone beacon receiver (80).
+        from .sensors import esxi_sensor, esxi_shell, ssh_shell_base, beacon
+        beacon.install_beacon_intercept(esxi_sensor.app)
+        return _run_threads({
+            "esxi_https": esxi_sensor.serve,
+            "esxi_ssh":   lambda: ssh_shell_base.run(esxi_shell.EsxiPersonality()),
+            "beacon":     beacon.serve,
+        })
     elif t == "fileshare":
         return _run_combined_fileshare()
     else:

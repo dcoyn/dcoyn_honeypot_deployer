@@ -134,13 +134,42 @@ def run() -> dict:
             if data.get("ja3_hash"):
                 ipd.setdefault("ja3", set()).add(data["ja3_hash"])
 
-        if et in ("ssh_auth", "ssh_login_ok", "http_login"):
+        if et in ("ssh_auth", "ssh_login_ok", "http_login", "esxi_login"):
             ipd["cred_attempts"] = ipd.get("cred_attempts", 0) + 1
             if data.get("accepted") or et == "ssh_login_ok":
                 ipd["cred_successes"] = ipd.get("cred_successes", 0) + 1
 
+        # ---- RDP / Terminal Services recon ----
+        if et == "rdp_connect":
+            if data.get("mstshash_user"):
+                ipd.setdefault("rdp_usernames", set()).add(data["mstshash_user"][:128])
+            for p in data.get("requested_protocols", []):
+                ipd.setdefault("rdp_requested_security", set()).add(p)
+        if et == "rdp_client_info" and data.get("client_name"):
+            ipd.setdefault("rdp_client_names", set()).add(data["client_name"][:128])
+
+        # ---- ESXi credential capture + hunting ----
+        if et == "esxi_login":
+            u = data.get("username", ""); p = data.get("password", "")
+            if u or p:
+                ipd.setdefault("esxi_credentials", set()).add(f"{u}:{p}"[:256])
+            ipd["esxi_targeted"] = True
+        if et == "esxi_request" and data.get("suspicious"):
+            ipd["esxi_targeted"] = True
+
         if et == "ssh_command":
             ipd["commands_run"] = ipd.get("commands_run", 0) + 1
+            svc = data.get("service", "")
+            cmd = (data.get("command") or "").strip()
+            if cmd:
+                if svc == "esxi_shell":
+                    ipd.setdefault("esxi_commands", set()).add(cmd[:300])
+                elif svc == "winserver_shell":
+                    ipd.setdefault("windows_commands", set()).add(cmd[:300])
+            # decoded powershell payloads are gold — surface them explicitly
+            dec = (data.get("classification") or {}).get("decoded_powershell")
+            if dec:
+                ipd.setdefault("decoded_powershell", set()).add(dec[:600])
 
         # ---- attacker intelligence rollups ----
         intel = data.get("intel") or {}
@@ -266,7 +295,9 @@ def run() -> dict:
                   "canary_slots_fired", "downloaded_from_ips",
                   "captured_identities", "captured_netntlmv2",
                   "docker_attack_chains", "docker_images", "crypto_wallets",
-                  "mining_pools"):
+                  "mining_pools", "rdp_usernames", "rdp_requested_security",
+                  "rdp_client_names", "esxi_credentials",
+                  "esxi_commands", "windows_commands", "decoded_powershell"):
             if k in upd and isinstance(upd[k], set):
                 upd[k] = sorted(upd[k])
             if k in existing and isinstance(existing[k], list):
@@ -283,7 +314,7 @@ def run() -> dict:
             upd["attack_categories"] = merged
         # sticky boolean flags
         for k in ("automated", "botnet_probe", "opened_canary", "captured_credentials",
-                  "deployed_container", "docker_host_escape_attempt"):
+                  "deployed_container", "docker_host_escape_attempt", "esxi_targeted"):
             if existing.get(k) or upd.get(k):
                 upd[k] = True
         for k in ("infra", "provider", "opener_kind"):

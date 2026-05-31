@@ -62,6 +62,10 @@ class EventType:
     REDIS_COMMAND    = "redis_command"       # parsed RESP command to fake redis
     DOCKER_API       = "docker_api"          # request to fake Docker Engine API
     DOCKER_CONTAINER_CREATE = "docker_container_create"  # parsed container-create payload
+    RDP_CONNECT      = "rdp_connect"          # RDP X.224 connect: cookie user + requested security
+    RDP_CLIENT_INFO  = "rdp_client_info"      # parsed MCS/GCC client core data (hostname/build)
+    ESXI_REQUEST     = "esxi_request"         # HTTP(S) request to fake VMware ESXi
+    ESXI_LOGIN       = "esxi_login"           # captured ESXi credentials (SOAP/UI)
     HEARTBEAT        = "heartbeat"
     NODE_START       = "node_start"
 

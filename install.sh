@@ -148,16 +148,16 @@ ok "Pre-flight passed (kernel $(uname -r), ${RAM_MB}MB RAM, ${DISK_MB}MB disk)"
 # -----------------------------------------------------------------------------
 ARG_TYPE="${1:-${HP_TYPE:-}}"
 case "$ARG_TYPE" in
-  ssh|owa|winserver|fileshare|telnet|redis|docker) ;;
+  ssh|owa|winserver|fileshare|telnet|redis|docker|rdp|esxi) ;;
   random)
-    ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare telnet redis docker)
+    ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare telnet redis docker rdp esxi)
     log "Random profile selected: $ARG_TYPE"
     ;;
   "")
     if [[ "${HP_NONINTERACTIVE:-0}" == "1" ]]; then
       die "Sensor profile not given. Pass as arg, or set HP_TYPE."
     fi
-    echo "Sensor profile? [1] ssh  [2] owa  [3] winserver  [4] fileshare  [5] telnet  [6] redis  [7] docker  [8] random"
+    echo "Sensor profile? [1] ssh  [2] owa  [3] winserver  [4] fileshare  [5] telnet  [6] redis  [7] docker  [8] rdp  [9] esxi  [10] random"
     read -rp "> " choice
     case "$choice" in
       1) ARG_TYPE=ssh ;;
@@ -167,11 +167,13 @@ case "$ARG_TYPE" in
       5) ARG_TYPE=telnet ;;
       6) ARG_TYPE=redis ;;
       7) ARG_TYPE=docker ;;
-      8) ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare telnet redis docker) ;;
+      8) ARG_TYPE=rdp ;;
+      9) ARG_TYPE=esxi ;;
+      10) ARG_TYPE=$(shuf -n1 -e ssh owa winserver fileshare telnet redis docker rdp esxi) ;;
       *) die "Invalid choice." ;;
     esac
     ;;
-  *) die "Unknown profile: '$ARG_TYPE' (use ssh|owa|winserver|fileshare|telnet|redis|docker|random)" ;;
+  *) die "Unknown profile: '$ARG_TYPE' (use ssh|owa|winserver|fileshare|telnet|redis|docker|rdp|esxi|random)" ;;
 esac
 
 # -----------------------------------------------------------------------------
@@ -331,9 +333,10 @@ EOF
 # -----------------------------------------------------------------------------
 # 9. Move real sshd to admin port BEFORE installing SSH sensor
 # -----------------------------------------------------------------------------
-# Profiles that bind port 22 (the SSH sensor): "ssh" and "fileshare".
-# Fileshare is a Linux box that, for credibility, also exposes the SSH sensor.
-if [[ "$ARG_TYPE" == "ssh" || "$ARG_TYPE" == "fileshare" ]]; then
+# Profiles that bind port 22 (an SSH fake-shell): ssh, fileshare, esxi, winserver.
+# fileshare = Linux box that also exposes SSH; esxi's mgmt shell is SSH; modern
+# Windows Server ships OpenSSH, so winserver exposes a cmd/PowerShell SSH shell.
+if [[ "$ARG_TYPE" == "ssh" || "$ARG_TYPE" == "fileshare" || "$ARG_TYPE" == "esxi" || "$ARG_TYPE" == "winserver" ]]; then
   log "Moving real sshd to port $ADMIN_SSH_PORT…"
   if ! grep -qE "^Port\s+$ADMIN_SSH_PORT" /etc/ssh/sshd_config; then
     cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$INSTALL_TS"
@@ -572,7 +575,20 @@ if [[ "$ARG_TYPE" == "fileshare" ]]; then
     ok "Fileshare cert at $AGENT_DATA/share.crt"
   fi
 fi
-if [[ "$ARG_TYPE" == "ssh" || "$ARG_TYPE" == "fileshare" ]]; then
+if [[ "$ARG_TYPE" == "esxi" ]]; then
+  if [[ ! -f "$AGENT_DATA/esxi.crt" ]]; then
+    log "Generating self-signed cert for ESXi…"
+    # Mimic the look of an ESXi host certificate (CN is the host's name).
+    openssl req -x509 -nodes -newkey rsa:2048 \
+      -keyout "$AGENT_DATA/esxi.key" -out "$AGENT_DATA/esxi.crt" \
+      -days 730 -subj "/CN=localhost.localdomain/O=VMware Installer" 2>/dev/null
+    chown root:"$SENSOR_USER" "$AGENT_DATA/esxi.key" "$AGENT_DATA/esxi.crt"
+    chmod 0640 "$AGENT_DATA/esxi.key"
+    chmod 0644 "$AGENT_DATA/esxi.crt"
+    ok "ESXi cert at $AGENT_DATA/esxi.crt"
+  fi
+fi
+if [[ "$ARG_TYPE" == "ssh" || "$ARG_TYPE" == "fileshare" || "$ARG_TYPE" == "esxi" || "$ARG_TYPE" == "winserver" ]]; then
   if [[ ! -f "$AGENT_DATA/ssh_host_rsa_key" ]]; then
     log "Generating sensor SSH host key…"
     ssh-keygen -q -t rsa -b 2048 -f "$AGENT_DATA/ssh_host_rsa_key" -N "" -C "ubuntu-prod-01"

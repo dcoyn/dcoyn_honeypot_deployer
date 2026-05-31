@@ -19,10 +19,12 @@ repos and produces fleet-wide IOC feeds.
 |-------------|---------------------------------------------|----------|
 | `ssh`       | 22 (real sshd moves to 62222)               | SSH auth attempts, kex, exec/shell commands, file drops, canary file exfil |
 | `owa`       | 80, 443 (self-signed TLS)                   | HTTP method/path/headers/body, login POSTs, scanner paths |
-| `winserver` | 135, 139, 445, 1433, 3389, 5985, 47001, 49152 | TCP payloads + plausible service banners (SMB2, MSSQL TDS, RDP X.224, WinRM) |
+| `winserver` | 135, 139, 445, 1433, 3389, 5985, 47001, 49152 + 22 | TCP payloads + plausible service banners (SMB2, MSSQL TDS, RDP X.224, WinRM), **plus a cmd.exe/PowerShell fake shell over OpenSSH (22)** that captures every Windows command an intruder runs against a realistic domain-joined server (fake `C:\`, tasklist, systeminfo, users, registry). Decodes `powershell -enc` payloads and flags shadow-copy deletion, account creation, and credential dumping. Real admin sshd moves to 62222. |
 | `telnet`    | 23                                          | IoT/Mirai magnet: fake BusyBox login + shell. Logs every credential and command, flags the BusyBox/`MIRAI` arch-probe as a botnet IOC |
 | `redis`     | 6379                                        | Speaks the RESP wire protocol. Logs every command and recognizes the classic unauth-Redis RCE chains (SSH-key write, cron write, `MODULE LOAD`, `SLAVEOF` replication) |
 | `docker`    | 2375                                        | Fake **Docker Engine API**. Speaks enough REST to keep cryptojacking bots (Kinsing/TeamTNT-style) talking, and captures the `/containers/create` payload: the image pulled, the command run, host bind-mounts / privileged / host-namespace **escape attempts** (T1611), miner images, mining pools, and IOC URLs — all classified to MITRE ATT&CK |
+| `rdp`       | 3389                                        | **RDP / Windows Terminal Services**. Does the X.224 negotiation and captures pre-auth recon: the `mstshash` cookie **username** (often `DOMAIN\user`), the requested security (RDP/TLS/CredSSP-NLA), and the client **hostname + build** from the MCS/GCC client-core block |
+| `esxi`      | 443 + 22                                    | **VMware ESXi** host (a top ransomware target). Serves a believable ESXi 7.x Welcome page + Host Client, answers the `/sdk` SOAP API (`RetrieveServiceContent` fingerprint), and **captures the credentials** from every SOAP `Login`. **Also exposes the ESXi shell over SSH (22)** — `esxcli`/`vim-cmd`/`esxtop` over a realistic host (fake VMs, VMFS datastores, CPU/RAM) — capturing the commands attackers run and flagging the VMFS-ransomware playbook (stopping VMs, hunting `.vmdk`). Real admin sshd moves to 62222. |
 | `fileshare` | 22 + 80 + 443 (real sshd moves to 62222)    | Linux box honeypot: Apache-style open share on 80/443 **and** the SSH sensor on 22. Bait docs (`.env`, `.git/`, SQL dumps, credentials.txt, DOCX/XLSX/HTML canaries) plus the full fake shell. Both sensors share the same per-VM FakeWorld, so the universe (org name, secrets, customer roster) is identical across all ports. |
 | `random`    | one of the above, picked at install         | — |
 
@@ -129,7 +131,7 @@ real sshd to port 62222 for `ssh`/`random` profiles.
 
 | Variable             | Default                          | Description |
 |----------------------|----------------------------------|-------------|
-| `HP_TYPE`            | (required)                       | `ssh` \| `owa` \| `winserver` \| `fileshare` \| `telnet` \| `redis` \| `docker` \| `random` |
+| `HP_TYPE`            | (required)                       | `ssh` \| `owa` \| `winserver` \| `fileshare` \| `telnet` \| `redis` \| `docker` \| `rdp` \| `esxi` \| `random` |
 | `HP_CANARY_URL`      | (empty)                          | Base URL embedded in canary docs (DOCX/XLSX/HTML). Beacon hits land here when an attacker opens an exfiltrated file. Operator-controlled; e.g. another OWA honeypot's URL, or a canarytokens.org token URL, or a dedicated webhook receiver. |
 | `HP_REPO`            | (required)                       | Per-VM logs repo URL (`https://github.com/<owner>/<repo>.git`) |
 | `HP_GIT_TOKEN`       | (required)                       | PAT for `HP_REPO`, `Contents: Read+write` |
@@ -256,7 +258,7 @@ Event types: `node_start`, `connection`, `tcp_payload`, `tls_fingerprint`,
 `ssh_login_ok`, `ssh_command`, `ssh_session_end`, `http_request`, `http_login`,
 `win_probe`, `win_payload`, `telnet_auth`, `telnet_command`,
 `telnet_session_end`, `redis_command`, `docker_api`,
-`docker_container_create`, `heartbeat`.
+`docker_container_create`, `rdp_connect`, `rdp_client_info`, `esxi_request`, `esxi_login`, `heartbeat`.
 
 ### Attacker intelligence (added to `data` on most events)
 
@@ -305,6 +307,11 @@ nodewatch/                          # renamed to kworker_XXXX at install
     telnet_sensor.py                # port 23 — IoT/Mirai BusyBox honeypot
     redis_sensor.py                 # port 6379 — RESP protocol, RCE-chain detection
     docker_sensor.py                # port 2375 — fake Docker API, container-escape capture
+    rdp_sensor.py                   # port 3389 — RDP/Terminal Services, pre-auth recon
+    esxi_sensor.py                  # port 443 — VMware ESXi, SOAP credential capture
+    ssh_shell_base.py               # reusable paramiko SSH fake-shell harness
+    esxi_shell.py                   # ESXi shell personality (esxcli/vim-cmd, SSH 22)
+    win_shell.py                    # Windows cmd/PowerShell shell personality (SSH 22)
     beacon.py                       # universal canary beacon receiver (non-HTTP profiles)
   network/
     packet_capture.py               # scapy sniffer → JA3/JA4 + HASSH

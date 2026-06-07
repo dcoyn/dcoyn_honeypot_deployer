@@ -950,6 +950,14 @@ class FakeFS:
             f"/var/backups/{v['canary_doc_backup_name']}.docx": (
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 self._build_canary_docx),
+            # PDF canary — beacons when opened in any PDF reader that fetches URLs
+            f"/var/backups/financial_report_2025.pdf": (
+                "application/pdf",
+                self._build_canary_pdf),
+            # RTF canary — beacons from Word/WordPad
+            f"/root/meeting_notes.rtf": (
+                "application/rtf",
+                self._build_canary_rtf),
         }
         for p in self._canary_paths:
             self._meta[p] = FileMeta(
@@ -1088,6 +1096,135 @@ class FakeFS:
             z.writestr("word/settings.xml", settings_xml)
             z.writestr("word/document.xml", document_xml)
         return buf.getvalue()
+
+    def _build_canary_pdf(self, download_id: str) -> bytes:
+        """Build a PDF that fetches an external URL when opened.
+        Uses PDF's /URI action and /AA (Additional Actions) to trigger a beacon
+        fetch when the document is opened in Adobe Reader, Foxit, Chrome PDF
+        viewer, or any compliant reader. The PDF also embeds a Submit-Form
+        action targeting our beacon URL — some readers process this automatically.
+        """
+        token = secrets.token_urlsafe(12)
+        v = self.v
+        base = self.canary_base
+        if base:
+            beacon_url = f"{base}/{self.agent}/{download_id}/img.{token}.png"
+        else:
+            beacon_url = f"about:blank#{token}"
+
+        # Minimal valid PDF with an OpenAction URI
+        # Object 1: Catalog
+        # Object 2: Pages
+        # Object 3: Page (with annotation link)
+        # Object 4: Font
+        # Object 5: URI Action (auto-open beacon)
+        # Object 6: Annotation (clickable link)
+        content_stream = (
+            f"BT\n/F1 12 Tf\n50 750 Td\n"
+            f"(CONFIDENTIAL - {v['org_short']} Financial Report 2025) Tj\n"
+            f"0 -20 Td\n(Prepared by: {v['ops_full']}) Tj\n"
+            f"0 -20 Td\n(Date: {v.get('today', '2026-01-15')}) Tj\n"
+            f"0 -40 Td\n/F1 10 Tf\n"
+            f"(Revenue Summary) Tj\n"
+            f"0 -20 Td\n(Q1 2025: $1,247,000) Tj\n"
+            f"0 -15 Td\n(Q2 2025: $1,389,000) Tj\n"
+            f"0 -15 Td\n(Q3 2025: $1,512,000) Tj\n"
+            f"0 -15 Td\n(Q4 2025: $1,678,000) Tj\n"
+            f"0 -30 Td\n(Total Annual Revenue: $5,826,000) Tj\n"
+            f"0 -40 Td\n(Key Accounts:) Tj\n"
+        )
+        for c in (v.get("customers") or [])[:5]:
+            company = str(c.get("company", "")).replace("(", "\\(").replace(")", "\\)")
+            content_stream += f"0 -15 Td\n(  - {company}: ${c.get('mrr_usd', 0):,}/mo) Tj\n"
+        content_stream += (
+            f"0 -40 Td\n(Database credentials - see vault.{v['int_domain']}) Tj\n"
+            f"0 -15 Td\n(Master password: {v['db_pass'][:12]}...) Tj\n"
+            f"0 -15 Td\n(AWS Key: {v['aws_key2']}) Tj\n"
+            f"ET\n"
+        )
+        stream_bytes = content_stream.encode("latin-1")
+
+        objects = []
+        # 1 Catalog
+        objects.append(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R "
+            b"/OpenAction 5 0 R "  # Auto-open beacon
+            b">>\nendobj\n")
+        # 2 Pages
+        objects.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+        # 3 Page
+        objects.append(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R "
+            b"/MediaBox [0 0 612 792] "
+            b"/Contents 7 0 R "
+            b"/Resources << /Font << /F1 4 0 R >> >> "
+            b"/Annots [6 0 R] "
+            b">>\nendobj\n")
+        # 4 Font
+        objects.append(
+            b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n")
+        # 5 OpenAction - URI
+        objects.append(
+            f"5 0 obj\n<< /Type /Action /S /URI /URI ({beacon_url}) >>\nendobj\n".encode("latin-1"))
+        # 6 Annotation link (clickable area)
+        objects.append(
+            f"6 0 obj\n<< /Type /Annot /Subtype /Link /Rect [0 0 612 792] "
+            f"/A << /S /URI /URI ({beacon_url}) >> /Border [0 0 0] >>\nendobj\n".encode("latin-1"))
+        # 7 Content stream
+        objects.append(
+            f"7 0 obj\n<< /Length {len(stream_bytes)} >>\nstream\n".encode("latin-1")
+            + stream_bytes
+            + b"\nendstream\nendobj\n")
+
+        pdf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        offsets = []
+        for obj in objects:
+            offsets.append(len(pdf))
+            pdf.extend(obj)
+        xref_offset = len(pdf)
+        pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode())
+        pdf.extend(b"0000000000 65535 f \n")
+        for off in offsets:
+            pdf.extend(f"{off:010d} 00000 n \n".encode())
+        pdf.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n".encode())
+        pdf.extend(f"startxref\n{xref_offset}\n%%EOF\n".encode())
+        return bytes(pdf)
+
+    def _build_canary_rtf(self, download_id: str) -> bytes:
+        """Build an RTF document that includes an external image reference.
+        When opened in Word or WordPad, the \\field{\\*\\fldinst INCLUDEPICTURE}
+        directive causes the application to fetch the beacon URL."""
+        token = secrets.token_urlsafe(12)
+        v = self.v
+        base = self.canary_base
+        if base:
+            beacon_url = f"{base}/{self.agent}/{download_id}/img.{token}.png"
+        else:
+            beacon_url = f"about:blank#{token}"
+
+        rtf = (
+            r"{\rtf1\ansi\deff0{\fonttbl{\f0 Calibri;}}" "\n"
+            r"{\info{\title CONFIDENTIAL - Meeting Notes}{\author " + v["ops_full"] + r"}}" "\n"
+            r"\paperw12240\paperh15840\margl1440\margr1440\margt1440\margb1440" "\n"
+            r"\pard\b\fs28 CONFIDENTIAL\b0\par" "\n"
+            r"\pard\fs24 Meeting Notes - Infrastructure Review\par" "\n"
+            r"\pard\fs20\par" "\n"
+            r"\pard Attendees: " + v["ops_full"] + ", " + v["dba_full"] + r"\par" "\n"
+            r"\pard Date: " + v.get("today", "2026-01-15") + r"\par\par" "\n"
+            r"\pard\b Action Items:\b0\par" "\n"
+            r"\pard - Rotate database master password (current: " + v["db_pass"][:12] + r"...)\par" "\n"
+            r"\pard - Update Vault token before expiry\par" "\n"
+            r"\pard - Review AWS IAM policies for " + v["aws_key2"] + r"\par" "\n"
+            r"\pard - Schedule DR test for next quarter\par\par" "\n"
+            r"\pard\b Infrastructure Endpoints:\b0\par" "\n"
+            r"\pard - Production DB: db-prod-01." + v["int_domain"] + r"\par" "\n"
+            r"\pard - Vault: vault." + v["int_domain"] + r":8200\par" "\n"
+            r"\pard - Bastion: bastion." + v["int_domain"] + r"\par\par" "\n"
+            # The beacon: INCLUDEPICTURE field
+            r"{\field{\*\fldinst INCLUDEPICTURE " + '"' + beacon_url + '"' + r" \\d}{\fldrslt}}" "\n"
+            r"}"
+        )
+        return rtf.encode("latin-1", errors="replace")
 
     def _build_canary_xlsx(self, download_id: str) -> bytes:
         token = secrets.token_urlsafe(12)

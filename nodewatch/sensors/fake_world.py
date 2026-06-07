@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import string
 from pathlib import Path
@@ -188,21 +189,79 @@ class FakeWorld:
         plans = ["starter", "growth", "enterprise"]
         plan_value = {"starter": 400, "growth": 1200, "enterprise": 4800}
 
+        # Real brand names mixed with plausible fake ones — attackers see what
+        # looks like a real customer roster with Fortune 500 names alongside
+        # smaller firms, making the data irresistibly "worth exfiltrating".
+        # These are simply used as customer NAMES in a fake database export.
+        _REAL_BRAND_COMPANIES = [
+            ("Deloitte", "deloitte.com", "US"),
+            ("Siemens AG", "siemens.com", "DE"),
+            ("Toyota Motor Corp", "toyota.com", "JP"),
+            ("HSBC Holdings", "hsbc.com", "UK"),
+            ("Samsung Electronics", "samsung.com", "KR"),
+            ("Nestlé S.A.", "nestle.com", "CH"),
+            ("Unilever", "unilever.com", "NL"),
+            ("SAP SE", "sap.com", "DE"),
+            ("L'Oréal", "loreal.com", "FR"),
+            ("Roche Holding", "roche.com", "CH"),
+            ("BMW Group", "bmw.com", "DE"),
+            ("Airbus SE", "airbus.com", "FR"),
+            ("Shell plc", "shell.com", "UK"),
+            ("Novartis AG", "novartis.com", "CH"),
+            ("Johnson & Johnson", "jnj.com", "US"),
+            ("Procter & Gamble", "pg.com", "US"),
+            ("Intel Corporation", "intel.com", "US"),
+            ("Cisco Systems", "cisco.com", "US"),
+            ("Oracle Corporation", "oracle.com", "US"),
+            ("IBM", "ibm.com", "US"),
+            ("Pfizer Inc", "pfizer.com", "US"),
+            ("Merck & Co", "merck.com", "US"),
+            ("General Electric", "ge.com", "US"),
+            ("3M Company", "3m.com", "US"),
+            ("Schneider Electric", "se.com", "FR"),
+            ("ABB Ltd", "abb.com", "CH"),
+            ("Volvo Group", "volvo.com", "SE"),
+            ("Maersk", "maersk.com", "DK"),
+            ("Tata Consultancy", "tcs.com", "IN"),
+            ("Infosys", "infosys.com", "IN"),
+            ("BHP Group", "bhp.com", "AU"),
+            ("Rio Tinto", "riotinto.com", "AU"),
+            ("BASF SE", "basf.com", "DE"),
+            ("Bayer AG", "bayer.com", "DE"),
+            ("Bosch", "bosch.com", "DE"),
+            ("Philips", "philips.com", "NL"),
+            ("Spotify AB", "spotify.com", "SE"),
+            ("Ericsson", "ericsson.com", "SE"),
+            ("Nokia Oyj", "nokia.com", "FI"),
+            ("Zoom Video", "zoom.us", "US"),
+        ]
+
         def _customer_id():
             return rng.randint(8000, 9999)
 
         def _customer_company():
-            # Combine: word from dict + industry-ish modifier OR word + word
+            # 40% chance: use a real brand name (makes the data look juicy)
+            # 60% chance: generate a plausible fake company
+            if rng.random() < 0.4 and _REAL_BRAND_COMPANIES:
+                brand = rng.choice(_REAL_BRAND_COMPANIES)
+                return brand[0]
             opts = [
                 lambda: f"{_pick_word()}-{rng.choice(industries)}".lower(),
                 lambda: f"{_pick_word()} {_pick_word()}".title(),
                 lambda: f"{_pick_word()} {rng.choice(['Group', 'Holdings', 'Partners', 'Systems'])}".title(),
+                lambda: f"{_pick_word()} {rng.choice(['Capital', 'Dynamics', 'Solutions', 'Global', 'Labs'])}".title(),
+                lambda: f"{_pick_word()}{rng.choice(['Tech', 'Corp', 'AI', 'IO', 'HQ'])}".title(),
             ]
             return rng.choice(opts)()
 
+        # Build a lookup of real brand domains for email generation
+        _brand_domain_map = {b[0]: b[1] for b in _REAL_BRAND_COMPANIES}
+        _brand_country_map = {b[0]: b[2] for b in _REAL_BRAND_COMPANIES}
+
         customers = []
         seen_ids: set[int] = set()
-        for _ in range(rng.randint(10, 14)):
+        seen_companies: set[str] = set()
+        for _ in range(rng.randint(12, 18)):
             cid = _customer_id()
             while cid in seen_ids:
                 cid = _customer_id()
@@ -210,18 +269,34 @@ class FakeWorld:
             first = rng.choice(first_names).lower()
             last  = rng.choice(last_names).lower().replace("'", "")
             company = _customer_company()
-            company_slug = company.lower().replace(" ", "").replace("-", "")
+            # avoid duplicate companies in the same roster
+            attempts = 0
+            while company in seen_companies and attempts < 10:
+                company = _customer_company()
+                attempts += 1
+            seen_companies.add(company)
+            # Use the real domain for real brands, generic for fakes
+            if company in _brand_domain_map:
+                email_domain = _brand_domain_map[company]
+                country = _brand_country_map.get(company, rng.choice(country_codes))
+            else:
+                company_slug = re.sub(r"[^a-z0-9]", "", company.lower())
+                email_domain = f"{company_slug}.com"
+                country = rng.choice(country_codes)
             plan = rng.choices(plans, weights=[2, 3, 5])[0]
-            mrr = plan_value[plan] * rng.choice([1, 2, 3])
+            mrr = plan_value[plan] * rng.choice([1, 2, 3, 5])
             customers.append({
                 "id": cid,
-                "email": f"{first[0]}.{last}@{company_slug}.example",
+                "email": f"{first}.{last}@{email_domain}",
                 "name": f"{first.title()} {last.title()}",
                 "company": company,
                 "plan": plan,
                 "mrr_usd": mrr,
-                "country": rng.choice(country_codes),
+                "country": country,
                 "signup_date": f"2024-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}",
+                "account_manager": f"{rng.choice(first_names)} {rng.choice(last_names)}",
+                "contract_end": f"2026-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}",
+                "payment_method": rng.choice(["wire_transfer", "credit_card", "ach", "invoice_net30"]),
             })
 
         # --- internal subdomain hosts. The base names (bastion/vault/db) are

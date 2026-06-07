@@ -312,6 +312,90 @@ def tag_event(ip: str,
             intel["automated"] = True
         elif all(v is False for v in automated_votes if v is not None) and automated_votes != [None, None]:
             intel["automated"] = False
+
+        # ---- Enrichment from geo data ----
+        if geo:
+            # TOR exit node check (from enrichment module)
+            if geo.get("is_tor_exit"):
+                intel.setdefault("source", {})["infra"] = "tor"
+                intel["is_tor_exit"] = True
+            # Known proxy
+            if geo.get("is_known_proxy"):
+                intel["is_known_proxy"] = True
+            # Abuse score
+            abuse = geo.get("abuse")
+            if abuse:
+                intel["abuse_score"] = abuse.get("abuse_score")
+                intel["abuse_reports"] = abuse.get("total_reports")
+                intel["abuse_isp"] = abuse.get("isp")
+                if abuse.get("abuse_score", 0) >= 80:
+                    intel["high_risk"] = True
+                    intel["risk_reason"] = f"AbuseIPDB score {abuse['abuse_score']}%"
+            # WHOIS org
+            whois = geo.get("whois")
+            if whois:
+                intel["whois_org"] = whois.get("org_name")
+                intel["abuse_contact"] = whois.get("abuse_email")
+                intel["net_name"] = whois.get("net_name")
+                intel["whois_cidr"] = whois.get("cidr")
+                intel["registration_date"] = whois.get("reg_date")
+            # FCrDNS
+            if geo.get("fcrdns_verified") is False:
+                intel["fcrdns_mismatch"] = True
+                intel["fcrdns_note"] = "PTR hostname does not resolve back to this IP (spoofed or stale rDNS)"
+            # Timing profile
+            timing = geo.get("timing")
+            if timing:
+                intel["connection_count"] = timing.get("total_connections")
+                if timing.get("rate_class"):
+                    intel["rate_class"] = timing["rate_class"]
+
+        # ---- Composite threat level ----
+        threat_level = _compute_threat_level(intel, geo)
+        if threat_level:
+            intel["threat_level"] = threat_level
+
     except Exception:
         return intel
     return intel
+
+
+def _compute_threat_level(intel: dict, geo: Optional[dict]) -> Optional[str]:
+    """Compute a composite threat level from all available signals."""
+    score = 0
+    reasons: list[str] = []
+
+    if intel.get("is_tor_exit"):
+        score += 3; reasons.append("TOR exit node")
+    if intel.get("high_risk"):
+        score += 3; reasons.append("high AbuseIPDB score")
+    if intel.get("is_known_proxy"):
+        score += 1; reasons.append("known proxy")
+    if intel.get("fcrdns_mismatch"):
+        score += 1; reasons.append("FCrDNS mismatch")
+    if intel.get("automated") is True:
+        score += 1; reasons.append("automated tool")
+    src = intel.get("source", {})
+    if src.get("infra") == "hosting":
+        score += 1; reasons.append("hosting/VPS infrastructure")
+    if src.get("is_scanner"):
+        score -= 1  # known scanners are noisy but usually benign
+
+    abuse_score = intel.get("abuse_score", 0) or 0
+    if abuse_score >= 50:
+        score += 2
+    elif abuse_score >= 25:
+        score += 1
+
+    if score >= 5:
+        level = "critical"
+    elif score >= 3:
+        level = "high"
+    elif score >= 1:
+        level = "medium"
+    else:
+        level = "low"
+
+    if reasons:
+        intel["threat_reasons"] = reasons
+    return level

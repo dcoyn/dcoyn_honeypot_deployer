@@ -437,13 +437,122 @@ def _beacon_intel(m, *, slot: Optional[str], extra: Optional[dict] = None) -> di
 
 def _handle_canary_beacon(m):
     slot = m.group("slot")
-    data = _beacon_intel(m, slot=slot)
+    # Parse JavaScript browser fingerprint data from query string (if present)
+    js_fp = _parse_js_fingerprint()
+    data = _beacon_intel(m, slot=slot, extra=js_fp if js_fp else None)
     _log_request(EventType.HTTP_REQUEST, data)
     return make_response(_PNG_1X1, 200, {
         "Content-Type":  "image/png",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Server":        "Apache/2.4.41 (Ubuntu)",
     })
+
+
+def _parse_js_fingerprint() -> dict:
+    """Extract browser fingerprint data sent by the HTML canary's JavaScript.
+    The JS sends all collected data as query parameters on the beacon image."""
+    args = request.args
+    if not args or len(args) < 3:
+        return {}
+    fp: dict = {"js_fingerprint": {}}
+    d = fp["js_fingerprint"]
+
+    # Screen info
+    for k in ("sw", "sh", "cd", "pd", "aw", "ah"):
+        v = args.get(k)
+        if v:
+            try:
+                d[{"sw": "screen_width", "sh": "screen_height",
+                   "cd": "color_depth", "pd": "pixel_ratio",
+                   "aw": "avail_width", "ah": "avail_height"}[k]] = float(v) if '.' in v else int(v)
+            except ValueError:
+                pass
+    # Timezone
+    if args.get("tz"):
+        d["timezone"] = args["tz"]
+        fp["opener_timezone"] = args["tz"]
+    if args.get("tzo"):
+        try:
+            d["timezone_offset_min"] = int(args["tzo"])
+        except ValueError:
+            pass
+    # Language
+    if args.get("lang"):
+        d["browser_language"] = args["lang"]
+    if args.get("langs"):
+        d["browser_languages"] = args["langs"].split(",")
+    # Platform
+    if args.get("plat"):
+        d["platform"] = args["plat"]
+        fp["opener_platform"] = args["plat"]
+    if args.get("vendor"):
+        d["vendor"] = args["vendor"]
+    # Hardware
+    for k, label in [("cores", "cpu_cores"), ("mem", "device_memory_gb"),
+                     ("touch", "max_touch_points")]:
+        v = args.get(k)
+        if v:
+            try:
+                d[label] = float(v) if '.' in v else int(v)
+            except ValueError:
+                pass
+    # Connection info
+    if args.get("conn"):
+        d["connection_type"] = args["conn"]
+    if args.get("dl"):
+        try:
+            d["downlink_mbps"] = float(args["dl"])
+        except ValueError:
+            pass
+    if args.get("rtt"):
+        try:
+            d["rtt_ms"] = int(args["rtt"])
+        except ValueError:
+            pass
+    # Battery
+    if args.get("bat"):
+        try:
+            d["battery_pct"] = int(args["bat"])
+        except ValueError:
+            pass
+    if args.get("charging"):
+        d["battery_charging"] = args["charging"].lower() == "true"
+    # Canvas fingerprint
+    if args.get("canvas"):
+        d["canvas_hash"] = args["canvas"][:120]
+    # WebGL / GPU
+    if args.get("gpu_vendor"):
+        d["gpu_vendor"] = args["gpu_vendor"][:200]
+        fp["opener_gpu_vendor"] = args["gpu_vendor"][:200]
+    if args.get("gpu_renderer"):
+        d["gpu_renderer"] = args["gpu_renderer"][:200]
+        fp["opener_gpu"] = args["gpu_renderer"][:200]
+    if args.get("webgl_vendor"):
+        d["webgl_vendor"] = args["webgl_vendor"][:200]
+    if args.get("webgl_renderer"):
+        d["webgl_renderer"] = args["webgl_renderer"][:200]
+    # Audio
+    if args.get("audio_sr"):
+        try:
+            d["audio_sample_rate"] = int(args["audio_sr"])
+        except ValueError:
+            pass
+    # Privacy / bot detection
+    if args.get("dnt"):
+        d["do_not_track"] = args["dnt"]
+    if args.get("gpc") and args["gpc"].lower() == "true":
+        d["global_privacy_control"] = True
+    if args.get("webdriver") and args["webdriver"].lower() == "true":
+        d["webdriver_detected"] = True
+        fp["opener_is_automated_browser"] = True
+    if args.get("pdf"):
+        d["pdf_viewer"] = args["pdf"].lower() == "true"
+    if args.get("cookies"):
+        d["cookies_enabled"] = args["cookies"].lower() == "true"
+    if args.get("localtime"):
+        d["local_time"] = args["localtime"][:40]
+
+    return fp
 
 
 def _handle_dav_beacon(m):
@@ -769,10 +878,18 @@ class FileShare:
         add_canary(f"/private/{cdoc_bk}.docx", MIME[".docx"],
                    self._fs._build_canary_docx,
                    mtime_offset_h=240, size_hint=22000)
-        # HTML canary — opens in any browser → instant beacon
+        # HTML canary — opens in any browser → instant beacon + JS fingerprint
         add_canary("/docs/internal-status-report.html", MIME[".html"],
                    self._build_html_canary,
                    mtime_offset_h=48, size_hint=8400)
+        # PDF canary — beacons from Adobe Reader/Foxit/Chrome PDF viewer
+        add_canary("/backups/financial_report_2025.pdf", MIME[".pdf"],
+                   self._fs._build_canary_pdf,
+                   mtime_offset_h=168, size_hint=14000)
+        # RTF canary — beacons from Word/WordPad via INCLUDEPICTURE
+        add_canary("/docs/meeting-notes-Q4.rtf", "application/rtf",
+                   self._fs._build_canary_rtf,
+                   mtime_offset_h=96, size_hint=4200)
 
         # ----- compute the set of all directories (implicit from file paths) -----
         for path in list(self.files.keys()) + list(self.canaries.keys()):
@@ -831,8 +948,10 @@ class FileShare:
         if base:
             beacon_img = f"{base}/{self.agent}/{download_id}/img.{token}.png"
             beacon_lnk = f"{base}/{self.agent}/{download_id}/lnk.{token}.png"
+            # JavaScript beacon endpoint — receives full browser fingerprint
+            beacon_js  = f"{base}/b/{self.agent}/{download_id}/img.{token}.png"
         else:
-            beacon_img = beacon_lnk = f"about:blank#{token}"
+            beacon_img = beacon_lnk = beacon_js = f"about:blank#{token}"
         v = self.v
         body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -845,6 +964,7 @@ class FileShare:
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ text-align: left; padding: 6px 12px; border-bottom: 1px solid #ddd; }}
     .confidential {{ color: #c33; font-weight: bold; }}
+    .footer {{ margin-top:2em; color:#888; font-size:0.85em; }}
   </style>
 </head>
 <body>
@@ -860,24 +980,141 @@ class FileShare:
     <li>Bastion: <code>bastion.{html.escape(v['int_domain'])}:22</code></li>
   </ul>
 
-  <h2>Customer Growth</h2>
+  <h2>Key Accounts</h2>
   <table>
-    <tr><th>Plan</th><th>Customers</th></tr>
-    <tr><td>Enterprise</td><td>{sum(1 for c in v['customers'] if c['plan']=='enterprise')}</td></tr>
-    <tr><td>Growth</td><td>{sum(1 for c in v['customers'] if c['plan']=='growth')}</td></tr>
-    <tr><td>Starter</td><td>{sum(1 for c in v['customers'] if c['plan']=='starter')}</td></tr>
+    <tr><th>Customer</th><th>Plan</th><th>MRR (USD)</th><th>Country</th></tr>"""
+        # Show top 5 customers to make it look like a real report
+        top5 = sorted(v.get('customers', []), key=lambda c: c.get('mrr_usd', 0), reverse=True)[:5]
+        for c in top5:
+            body += f"""
+    <tr><td>{html.escape(str(c.get('company','')))}</td><td>{html.escape(str(c.get('plan','')))}</td><td>${c.get('mrr_usd',0):,}</td><td>{html.escape(str(c.get('country','')))}</td></tr>"""
+        body += f"""
   </table>
 
-  <h2>Notes</h2>
-  <p>Stripe webhook secret rotated: <code>whsec_{html.escape(v['stripe_whsec'][:16])}…</code></p>
-  <p>Admin API token (do not commit): <code>{html.escape(v['admin_token'][:20])}…</code></p>
+  <h2>Customer Growth</h2>
+  <table>
+    <tr><th>Plan</th><th>Customers</th><th>Total MRR</th></tr>
+    <tr><td>Enterprise</td><td>{sum(1 for c in v['customers'] if c['plan']=='enterprise')}</td><td>${sum(c['mrr_usd'] for c in v['customers'] if c['plan']=='enterprise'):,}</td></tr>
+    <tr><td>Growth</td><td>{sum(1 for c in v['customers'] if c['plan']=='growth')}</td><td>${sum(c['mrr_usd'] for c in v['customers'] if c['plan']=='growth'):,}</td></tr>
+    <tr><td>Starter</td><td>{sum(1 for c in v['customers'] if c['plan']=='starter')}</td><td>${sum(c['mrr_usd'] for c in v['customers'] if c['plan']=='starter'):,}</td></tr>
+  </table>
+
+  <h2>Credentials & Secrets</h2>
+  <p>Stripe webhook secret rotated: <code>whsec_{html.escape(v['stripe_whsec'][:16])}...</code></p>
+  <p>Admin API token (do not commit): <code>{html.escape(v['admin_token'][:20])}...</code></p>
+  <p>AWS production key: <code>{html.escape(v['aws_key2'])}</code></p>
+  <p>Vault root token: <code>{html.escape(v['vault_token'][:20])}...</code></p>
   <p>Full credentials archive:
      <a href="{html.escape(beacon_lnk)}">vault-export-full.zip</a> (click to download)</p>
 
-  <p style="margin-top:2em; color:#888; font-size:0.85em;">
+  <div class="footer">
     <img src="{html.escape(beacon_img)}" width="1" height="1" alt="" />
-    Document ID: {html.escape(download_id)}
-  </p>
+    <p>Document ID: {html.escape(download_id)}</p>
+  </div>
+
+  <!-- Browser fingerprint beacon: collects maximum attacker machine details.
+       This fires silently when the HTML file is opened in any browser, sending
+       screen resolution, timezone, installed plugins, canvas fingerprint,
+       WebGL renderer (GPU), battery level, connection type, device memory,
+       CPU cores, audio context fingerprint, and installed fonts. All sent as
+       query parameters on a 1x1 pixel image request. -->
+  <script>
+  (function(){{
+    try {{
+      var d = {{}};
+      // Screen
+      d.sw = screen.width;
+      d.sh = screen.height;
+      d.cd = screen.colorDepth;
+      d.pd = window.devicePixelRatio || 1;
+      d.aw = screen.availWidth;
+      d.ah = screen.availHeight;
+      // Timezone
+      d.tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+      d.tzo = new Date().getTimezoneOffset();
+      // Language
+      d.lang = navigator.language || '';
+      d.langs = (navigator.languages || []).join(',');
+      // Platform/OS
+      d.plat = navigator.platform || '';
+      d.ua = navigator.userAgent || '';
+      d.vendor = navigator.vendor || '';
+      // Hardware
+      d.cores = navigator.hardwareConcurrency || 0;
+      d.mem = navigator.deviceMemory || 0;
+      d.touch = navigator.maxTouchPoints || 0;
+      // Connection
+      if (navigator.connection) {{
+        d.conn = navigator.connection.effectiveType || '';
+        d.dl = navigator.connection.downlink || 0;
+        d.rtt = navigator.connection.rtt || 0;
+      }}
+      // Battery
+      if (navigator.getBattery) {{
+        navigator.getBattery().then(function(b){{
+          d.bat = Math.round(b.level * 100);
+          d.charging = b.charging;
+          _send(d);
+        }}).catch(function(){{ _send(d); }});
+      }} else {{
+        _send(d);
+      }}
+      // Canvas fingerprint
+      try {{
+        var c = document.createElement('canvas');
+        c.width = 200; c.height = 50;
+        var ctx = c.getContext('2d');
+        ctx.textBaseline = 'top';
+        ctx.font = '14px Arial';
+        ctx.fillStyle = '#f60';
+        ctx.fillRect(0, 0, 200, 50);
+        ctx.fillStyle = '#069';
+        ctx.fillText('nodewatch fp', 2, 15);
+        ctx.fillStyle = 'rgba(102,204,0,0.7)';
+        ctx.fillText('nodewatch fp', 4, 17);
+        d.canvas = c.toDataURL().slice(0, 100);
+      }} catch(e) {{}}
+      // WebGL renderer (GPU identification)
+      try {{
+        var gl = document.createElement('canvas').getContext('webgl');
+        if (gl) {{
+          var ext = gl.getExtension('WEBGL_debug_renderer_info');
+          if (ext) {{
+            d.gpu_vendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL);
+            d.gpu_renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+          }}
+          d.webgl_vendor = gl.getParameter(gl.VENDOR);
+          d.webgl_renderer = gl.getParameter(gl.RENDERER);
+        }}
+      }} catch(e) {{}}
+      // Audio context fingerprint
+      try {{
+        var ac = new (window.AudioContext || window.webkitAudioContext)();
+        d.audio_sr = ac.sampleRate;
+        d.audio_state = ac.state;
+        ac.close();
+      }} catch(e) {{}}
+      // Do-not-track / Global Privacy Control
+      d.dnt = navigator.doNotTrack || '';
+      d.gpc = navigator.globalPrivacyControl || false;
+      // Webdriver detection (are they using Selenium/Puppeteer?)
+      d.webdriver = navigator.webdriver || false;
+      // PDF viewer plugin
+      d.pdf = navigator.pdfViewerEnabled || false;
+      // Cookies enabled
+      d.cookies = navigator.cookieEnabled;
+      // Local time
+      d.localtime = new Date().toISOString();
+
+      function _send(data) {{
+        var qs = Object.keys(data).map(function(k){{
+          return encodeURIComponent(k) + '=' + encodeURIComponent(data[k]);
+        }}).join('&');
+        new Image().src = '{html.escape(beacon_js)}' + '?' + qs;
+      }}
+    }} catch(e) {{}}
+  }})();
+  </script>
 </body>
 </html>"""
         return body.encode("utf-8")

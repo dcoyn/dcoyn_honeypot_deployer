@@ -31,6 +31,7 @@ Event schema (minimum fields):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -87,6 +88,9 @@ class EventLogger:
         self.node_name = node_name
         self.sensor_profile = sensor_profile
         self.events_file = self.log_dir / "events.jsonl"
+        # Salt for IP hashing — stable per node so hashes are consistent
+        # within a node but differ across nodes (privacy-safe correlation)
+        self._ip_salt = hashlib.sha256(node_name.encode()).hexdigest()[:16]
 
     # ----------------------------------------------------------------- emit
     def emit(
@@ -103,6 +107,7 @@ class EventLogger:
     ) -> dict:
         rec = {
             "ts": _now_iso(),
+            "ts_epoch": time.time(),
             "event_id": str(uuid.uuid4()),
             "session_id": session_id or "",
             "node_name": self.node_name,
@@ -114,6 +119,13 @@ class EventLogger:
             "proto": proto,
             "data": data or {},
         }
+        # Add IP hash for cross-node correlation without revealing the IP
+        # in aggregated/shared exports
+        try:
+            rec["src_ip_sha256"] = hashlib.sha256(
+                (src_ip + self._ip_salt).encode()).hexdigest()[:16]
+        except Exception:
+            pass
         line = json.dumps(rec, separators=(",", ":"), ensure_ascii=False, default=str)
         with _LOG_LOCK:
             # Global stream
@@ -123,6 +135,16 @@ class EventLogger:
             if session_id:
                 with open(self.session_dir / f"{session_id}.jsonl", "a", encoding="utf-8") as f:
                     f.write(line + "\n")
+            # Per-IP stream — enables quick tail of all events from one attacker
+            if src_ip and src_ip != "0.0.0.0":
+                ip_dir = self.log_dir / "by_ip"
+                try:
+                    ip_dir.mkdir(parents=True, exist_ok=True)
+                    safe_ip = src_ip.replace(":", "_")
+                    with open(ip_dir / f"{safe_ip}.jsonl", "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                except Exception:
+                    pass
         return rec
 
     # ----------------------------------------------------------------- helpers

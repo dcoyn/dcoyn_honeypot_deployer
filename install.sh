@@ -874,8 +874,13 @@ fi
 #   HP_EVENTS_MAX_MB      : size cap for the monolithic events.jsonl before it is
 #                           truncated (only ever when the aggregator has already
 #                           consumed it to EOF — see the prune script)
+#   HP_DISK_BUDGET_GB     : ceiling for $AGENT_DATA + $AGENT_LOGS. The sync user
+#                           keeps under it via git gc -> shallow -> raw-event trim
+#   HP_MIN_EVENT_DAYS     : never trim raw-event days newer than this (floor)
 HP_LOG_RETENTION_DAYS="${HP_LOG_RETENTION_DAYS:-3}"
 HP_EVENTS_MAX_MB="${HP_EVENTS_MAX_MB:-200}"
+HP_DISK_BUDGET_GB="${HP_DISK_BUDGET_GB:-8}"
+HP_MIN_EVENT_DAYS="${HP_MIN_EVENT_DAYS:-14}"
 
 cat > "$AGENT_ETC/env" <<EOF
 HP_CONFIG=$AGENT_HOME/config.json
@@ -884,6 +889,8 @@ HP_CONNLOG_PATH=$AGENT_LOGS/kernel-connections.log
 HP_CANARY_URL=$HP_CANARY_URL
 HP_LOG_RETENTION_DAYS=$HP_LOG_RETENTION_DAYS
 HP_EVENTS_MAX_MB=$HP_EVENTS_MAX_MB
+HP_DISK_BUDGET_GB=$HP_DISK_BUDGET_GB
+HP_MIN_EVENT_DAYS=$HP_MIN_EVENT_DAYS
 EOF
 chmod 0644 "$AGENT_ETC/env"
 INSTALLED_FILES+=("$AGENT_ETC/env")

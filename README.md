@@ -214,6 +214,8 @@ export HP_CANARY_URL="http://203.0.113.10"
 # Tune local-log retention at install time (see Log retention below).
 export HP_LOG_RETENTION_DAYS=3      # session/IP jsonl age cap (days)
 export HP_EVENTS_MAX_MB=200         # events.jsonl size cap (MB)
+export HP_DISK_BUDGET_GB=8          # hard ceiling for /var/lib + /var/log
+export HP_MIN_EVENT_DAYS=14         # never trim raw-event days newer than this
 ```
 
 After install, the operator summary and `/root/.agent-info` record the chosen
@@ -301,6 +303,69 @@ sudo journalctl -u ${NAME}-log-prune.service -n 20 --no-pager
 sudo du -sh /var/log/${NAME} /var/log/${NAME}/sessions /var/log/${NAME}/by_ip
 ```
 
+### The git store (`/var/lib/<agent>/store`) and the disk budget
+
+The per-node git repo is the other big disk consumer. Each 5-minute sync
+commits and pushes; the aggregator rewrites whole profile files (`ips/*.json`,
+`sessions/*.json`, `node.json`) and appends raw events, so without maintenance
+`.git/objects` accumulates every version forever — even though GitHub already
+has the full history.
+
+The sync user keeps the agent's `/var/lib` + `/var/log` footprint under
+`HP_DISK_BUDGET_GB` (default **8**, with the `HP_MIN_EVENT_DAYS` floor, default
+**14**) automatically, right after each successful push, in three tiers,
+cheapest first:
+
+1. **`git gc`** (daily) — packs and delta-compresses loose objects. On a repo
+   that has never been gc'd this is the dominant win: thousands of
+   near-identical rewritten JSON blobs compress dramatically.
+2. **Shallow truncation** (weekly, or immediately when over budget) —
+   `git fetch --depth=1` + reset to `origin/main`, so the *local* clone forgets
+   old history. The remote keeps full history, so this never force-pushes and
+   the central aggregator is unaffected.
+3. **Raw-event trim** (only if still over budget) — deletes the oldest
+   `events/YYYY/MM/DD` directories from the tree and pushes the deletion, never
+   touching days newer than `HP_MIN_EVENT_DAYS`. The remote's git history still
+   retains them.
+
+The aggregator cursor (`.git/hp-state.json`) is untracked, so gc / shallow /
+reset all leave it intact — no events are reprocessed.
+
+To change the ceiling:
+
+```bash
+NAME=$(sudo awk -F= '/^agent_name/{print $2}' /root/.agent-info)
+sudo sed -i 's/^HP_DISK_BUDGET_GB=.*/HP_DISK_BUDGET_GB=6/' /etc/${NAME}/env
+sudo sed -i 's/^HP_MIN_EVENT_DAYS=.*/HP_MIN_EVENT_DAYS=7/' /etc/${NAME}/env
+# enforced on the next sync; force one now:
+sudo systemctl start ${NAME}-sync.service
+```
+
+**Reclaim a store that has already ballooned** (one-time, before the automated
+maintenance has run — e.g. on an older install). Run as the sync user; the repo
+is owned by `<agent>-y` and running git as root would create root-owned objects
+that break the next push:
+
+```bash
+NAME=$(sudo awk -F= '/^agent_name/{print $2}' /root/.agent-info)
+REPO=/var/lib/$NAME/store
+
+sudo systemctl start ${NAME}-sync.service          # flush a sync first
+
+# simple — keeps full local history, memory-capped for small boxes
+sudo -u ${NAME}-y git -C "$REPO" \
+  -c pack.threads=1 -c pack.windowMemory=64m -c pack.deltaCacheSize=32m \
+  gc --prune=now
+
+# maximum reclaim / lowest memory — drops LOCAL history (remote keeps it)
+sudo -u ${NAME}-y git -C "$REPO" fetch --depth=1 origin main
+sudo -u ${NAME}-y git -C "$REPO" reset --hard origin/main
+sudo -u ${NAME}-y git -C "$REPO" reflog expire --expire=now --all
+sudo -u ${NAME}-y git -C "$REPO" gc --prune=now
+
+sudo du -sh "$REPO/.git"
+```
+
 ---
 
 ## Environment variables
@@ -317,6 +382,8 @@ sudo du -sh /var/log/${NAME} /var/log/${NAME}/sessions /var/log/${NAME}/by_ip
 | `HP_PCAP_IFACE`         | autodetected (`eth0` / `ens3`)   | Interface for the passive JA3/JA4 capture |
 | `HP_LOG_RETENTION_DAYS` | `3`                              | Age cap (days) for `sessions/` and `by_ip/` jsonl files in the local cache |
 | `HP_EVENTS_MAX_MB`      | `200`                            | Size cap (MB) for `events.jsonl` before a cursor-safe truncate |
+| `HP_DISK_BUDGET_GB`     | `8`                              | Ceiling for the agent's `/var/lib` + `/var/log` footprint. The sync user keeps under it (git gc → shallow → raw-event trim). Set below your disk size with headroom for the OS. |
+| `HP_MIN_EVENT_DAYS`     | `14`                             | Floor for budget enforcement: never trim raw-event day directories newer than this |
 | `HP_INSTALL_REPO`       | `https://github.com/dcoyn/dcoyn_honeypot_deployer.git` | Where install.sh fetches its source |
 | `HP_INSTALL_TOKEN`      | falls back to `HP_GIT_TOKEN`     | PAT for the deployer repo if it's private |
 | `HP_NONINTERACTIVE`     | `0`                              | `1` disables all prompts |

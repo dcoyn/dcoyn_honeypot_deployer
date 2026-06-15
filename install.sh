@@ -866,11 +866,24 @@ if [ -z "${HP_CANARY_URL:-}" ]; then
   fi
 fi
 
+# Local-log retention knobs (read by the log-prune timer). Raw events are
+# already mirrored into the per-node git repo (events/YYYY/MM/DD/*.jsonl) and
+# pushed to GitHub, so the copies under /var/log are a local convenience cache,
+# not the system of record — safe to age out.
+#   HP_LOG_RETENTION_DAYS : delete per-session / per-IP jsonl files older than this
+#   HP_EVENTS_MAX_MB      : size cap for the monolithic events.jsonl before it is
+#                           truncated (only ever when the aggregator has already
+#                           consumed it to EOF — see the prune script)
+HP_LOG_RETENTION_DAYS="${HP_LOG_RETENTION_DAYS:-3}"
+HP_EVENTS_MAX_MB="${HP_EVENTS_MAX_MB:-200}"
+
 cat > "$AGENT_ETC/env" <<EOF
 HP_CONFIG=$AGENT_HOME/config.json
 HP_NFT_PREFIX=$NFT_PREFIX_UP
 HP_CONNLOG_PATH=$AGENT_LOGS/kernel-connections.log
 HP_CANARY_URL=$HP_CANARY_URL
+HP_LOG_RETENTION_DAYS=$HP_LOG_RETENTION_DAYS
+HP_EVENTS_MAX_MB=$HP_EVENTS_MAX_MB
 EOF
 chmod 0644 "$AGENT_ETC/env"
 INSTALLED_FILES+=("$AGENT_ETC/env")
@@ -1069,6 +1082,123 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+# Log retention: the per-node git repo (pushed to GitHub every few minutes) is
+# the system of record; the copies under $AGENT_LOGS are a local convenience
+# cache. This script ages that cache out.
+#
+#  - sessions/*.jsonl and by_ip/*.jsonl are independent per-session/per-IP files
+#    and are NOT tracked by the aggregator's byte cursor -> safe to delete by age.
+#  - events.jsonl is a single append-only file the aggregator reads by byte
+#    offset (stored as {"pos":N} in the repo's .git/hp-state.json). It is only
+#    ever truncated when the aggregator has already consumed it to EOF, and the
+#    cursor is reset to 0 in the same step -> no un-synced event is lost.
+cat > /usr/local/sbin/$AGENT_NAME-log-prune.sh <<PRUNE
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOGS="$AGENT_LOGS"
+STATE="$AGENT_REPO_DIR/.git/hp-state.json"
+
+RET="\${HP_LOG_RETENTION_DAYS:-3}"
+MAXMB="\${HP_EVENTS_MAX_MB:-200}"
+[ -r "$AGENT_ETC/env" ] && . "$AGENT_ETC/env"
+RET="\${HP_LOG_RETENTION_DAYS:-\$RET}"
+MAXMB="\${HP_EVENTS_MAX_MB:-\$MAXMB}"
+
+echo "[prune] retention=\${RET}d events_cap=\${MAXMB}MB logs=\$LOGS"
+
+# 1) Age out the per-session / per-IP fan-out files (safe; not cursor-tracked).
+for sub in sessions by_ip; do
+  d="\$LOGS/\$sub"
+  [ -d "\$d" ] || continue
+  before=\$(find "\$d" -type f -name '*.jsonl' 2>/dev/null | wc -l)
+  find "\$d" -type f -name '*.jsonl' -mtime +"\$RET" -delete 2>/dev/null || true
+  find "\$d" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  after=\$(find "\$d" -type f -name '*.jsonl' 2>/dev/null | wc -l)
+  echo "[prune] \$sub: \$before -> \$after files (removed \$((before-after)) older than \${RET}d)"
+done
+
+# 2) Bound the monolithic events.jsonl — only when fully aggregated (cursor-safe).
+EVENTS="\$LOGS/events.jsonl"
+if [ -f "\$EVENTS" ]; then
+  size=\$(stat -c%s "\$EVENTS" 2>/dev/null || echo 0)
+  cap=\$(( MAXMB * 1024 * 1024 ))
+  if [ "\$size" -lt "\$cap" ]; then
+    echo "[prune] events.jsonl \$((size/1024/1024))MB < \${MAXMB}MB cap; leaving as-is"
+  else
+    pos=0
+    if [ -r "\$STATE" ]; then
+      pos=\$(python3 - "\$STATE" <<'PY'
+import json,sys
+try:
+    print(int(json.load(open(sys.argv[1])).get("pos",0)))
+except Exception:
+    print(0)
+PY
+)
+    fi
+    # Re-stat immediately before the decision to shrink the append race window.
+    size=\$(stat -c%s "\$EVENTS" 2>/dev/null || echo 0)
+    if [ "\$pos" -ge "\$size" ]; then
+      owner=\$(stat -c '%U:%G' "\$EVENTS" 2>/dev/null || echo 'root:root')
+      : > "\$EVENTS"                       # truncate to 0, keep inode/owner/mode
+      chown "\$owner" "\$EVENTS" 2>/dev/null || true
+      if [ -f "\$STATE" ]; then            # reset cursor (preserve other keys + owner)
+        sowner=\$(stat -c '%U:%G' "\$STATE" 2>/dev/null || echo 'root:root')
+        python3 - "\$STATE" <<'PY'
+import json,os,sys
+p=sys.argv[1]
+try:
+    d=json.load(open(p))
+except Exception:
+    d={}
+d["pos"]=0
+tmp=p+".tmp"
+json.dump(d,open(tmp,"w"))
+os.replace(tmp,p)
+PY
+        chown "\$sowner" "\$STATE" 2>/dev/null || true
+      fi
+      echo "[prune] events.jsonl truncated (was \$((size/1024/1024))MB, fully aggregated); cursor reset to 0"
+    else
+      echo "[prune] events.jsonl \$((size/1024/1024))MB >= cap but \$((size-pos)) bytes not yet aggregated; skipping this cycle"
+    fi
+  fi
+fi
+PRUNE
+chmod 0755 /usr/local/sbin/$AGENT_NAME-log-prune.sh
+INSTALLED_FILES+=("/usr/local/sbin/$AGENT_NAME-log-prune.sh")
+
+_write_unit /etc/systemd/system/$AGENT_NAME-log-prune.service <<EOF
+[Unit]
+Description=Worker cache retention for $AGENT_NAME
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=$AGENT_ETC/env
+ExecStart=/usr/local/sbin/$AGENT_NAME-log-prune.sh
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=$AGENT_LOGS $AGENT_REPO_DIR
+EOF
+
+_write_unit /etc/systemd/system/$AGENT_NAME-log-prune.timer <<EOF
+[Unit]
+Description=Daily worker cache retention for $AGENT_NAME
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 
 # -----------------------------------------------------------------------------
@@ -1101,6 +1231,11 @@ _start_and_verify "${SVC_MAIN}.service"     || die  "${SVC_MAIN} failed to start
 systemctl enable --now "${SVC_SYNC}.timer" 2>>"$INSTALL_LOG"
 INSTALLED_UNITS+=("${SVC_SYNC}.timer")
 ok "  ${SVC_SYNC}.timer enabled"
+
+# Log-prune timer (daily retention of the local /var/log cache)
+systemctl enable --now "$AGENT_NAME-log-prune.timer" 2>>"$INSTALL_LOG"
+INSTALLED_UNITS+=("$AGENT_NAME-log-prune.timer")
+ok "  $AGENT_NAME-log-prune.timer enabled (daily; keeps ${HP_LOG_RETENTION_DAYS}d of session/IP logs, caps events.jsonl at ${HP_EVENTS_MAX_MB}MB)"
 
 # Kick a sync immediately to verify the path works (don't fail the install if it errs)
 log "Kicking initial sync (this may take 30s)…"

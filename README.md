@@ -1,17 +1,23 @@
 # dcoyn_honeypot_deployer
 
-Debian honeypot agent. One VM runs one of four sensor profiles
-(`ssh`, `owa`, `winserver`, `fileshare`), captures events to JSONL, and pushes them
-every five minutes to a per-VM private GitHub repo via systemd timer.
-A separate central aggregator (in another repo) consolidates per-node
-repos and produces fleet-wide IOC feeds.
+Debian honeypot agent. One VM runs one of nine sensor profiles
+(`ssh`, `owa`, `winserver`, `fileshare`, `telnet`, `redis`, `docker`, `rdp`,
+`esxi`), captures events to JSONL, and pushes them every five minutes to a
+per-VM private GitHub repo via a systemd timer. A separate central aggregator
+(in another repo) consolidates per-node repos and produces fleet-wide IOC feeds.
+
+The deployed agent never contains the string `honeypot`: it installs under a
+randomly generated `kworker-XXXX` name so it blends into a busy box's process
+and log noise.
 
 ## Requirements
 
 - Debian 12+, kernel ≥ 4.x
-- 384 MB RAM, 1 GB disk
+- 384 MB RAM, 1 GB disk (local logs are size-bounded — see [Log retention](#log-retention--disk-usage))
 - Outbound HTTPS to `github.com`
 - Root during install (drops to unprivileged users at runtime)
+- A private per-node GitHub repo + a fine-grained PAT scoped to it
+  (`Contents: Read+write`, that one repo only)
 
 ## Profiles
 
@@ -30,32 +36,33 @@ repos and produces fleet-wide IOC feeds.
 
 On every profile: nftables connection log, JA3+JA4 fingerprinting **plus passive HASSH (SSH client) fingerprinting** via the sniff sidecar, PTR + GeoIP/ASN lookup, offline threat-intel tagging (hosting/cloud/Tor + SSH-tool/UA classification), MITRE ATT&CK classification of every command and HTTP path, and 300 s session tracking.
 
-## Install
+> **Profiles that move the real sshd to port 62222:** `ssh`, `fileshare`,
+> `esxi`, `winserver` (and `random` when it lands on one of them). **Keep a
+> second SSH session open on the new port as a safety net during install.**
 
-Run on a fresh VM as root. The installer prompts for the per-node repo URL
-and its PAT (fine-grained, `Contents: Read+write`, scoped to that one repo).
-Keep a second SSH session open as a safety net — the installer moves the
-real sshd to port 62222 for `ssh`/`random` profiles.
+---
 
-### Random profile
+## Deploy a honeypot
+
+The installer prompts for the per-node repo URL and its PAT, picks a random
+`kworker-XXXX` agent name, lays down the systemd units, and kicks an initial
+sync to prove the path to GitHub works.
+
+### Option A — interactive (simplest)
+
+Clone the repo (or copy `install.sh`) onto a fresh VM and run it as root. It
+asks for the profile (menu), the repo URL, and the token:
 
 ```bash
- unset HISTFILE; set +o history; \
- read -rp "Node repo URL: " REPO; \
- read -rsp "Token for that repo: " GH; echo; \
- [ -n "$GH" ] && [ -n "$REPO" ] && \
- export HP_GIT_TOKEN="$GH" \
-        HP_REPO="$REPO" \
-        HP_TYPE=random \
-        HP_NODE_NAME="$(hostname)" \
-        HP_NONINTERACTIVE=1 && \
- curl -fsSL \
-      https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh \
-   | sudo -E bash; \
- unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+sudo bash install.sh
+# or pass the profile directly and only get asked for repo + token:
+sudo bash install.sh ssh
 ```
 
-### SSH
+### Option B — non-interactive one-liner (any profile)
+
+This is the canonical remote install. **Change the one `HP_TYPE=` line** to any
+value from the [Profiles](#profiles) table — everything else is identical:
 
 ```bash
  unset HISTFILE; set +o history; \
@@ -73,75 +80,246 @@ real sshd to port 62222 for `ssh`/`random` profiles.
  unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
 ```
 
-### OWA
+(`unset HISTFILE; set +o history` keeps the token out of your shell history;
+the trailing `unset` scrubs it from the environment.)
 
+<details>
+<summary><b>Ready-to-paste, one block per profile</b> (click to expand)</summary>
+
+Each block is identical except for `HP_TYPE=`.
+
+#### ssh
 ```bash
  unset HISTFILE; set +o history; \
- read -rp "Node repo URL: " REPO; \
- read -rsp "Token for that repo: " GH; echo; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
  [ -n "$GH" ] && [ -n "$REPO" ] && \
- export HP_GIT_TOKEN="$GH" \
-        HP_REPO="$REPO" \
-        HP_TYPE=owa \
-        HP_NODE_NAME="$(hostname)" \
-        HP_NONINTERACTIVE=1 && \
- curl -fsSL \
-      https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh \
-   | sudo -E bash; \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=ssh \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
  unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
 ```
 
-### Winserver
-
+#### owa
 ```bash
  unset HISTFILE; set +o history; \
- read -rp "Node repo URL: " REPO; \
- read -rsp "Token for that repo: " GH; echo; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
  [ -n "$GH" ] && [ -n "$REPO" ] && \
- export HP_GIT_TOKEN="$GH" \
-        HP_REPO="$REPO" \
-        HP_TYPE=winserver \
-        HP_NODE_NAME="$(hostname)" \
-        HP_NONINTERACTIVE=1 && \
- curl -fsSL \
-      https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh \
-   | sudo -E bash; \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=owa \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
  unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
 ```
 
-### Fileshare
-
+#### winserver
 ```bash
  unset HISTFILE; set +o history; \
- read -rp "Node repo URL: " REPO; \
- read -rsp "Token for that repo: " GH; echo; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
  [ -n "$GH" ] && [ -n "$REPO" ] && \
- export HP_GIT_TOKEN="$GH" \
-        HP_REPO="$REPO" \
-        HP_TYPE=fileshare \
-        HP_NODE_NAME="$(hostname)" \
-        HP_NONINTERACTIVE=1 && \
- curl -fsSL \
-      https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh \
-   | sudo -E bash; \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=winserver \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
  unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
 ```
+
+#### fileshare
+```bash
+ unset HISTFILE; set +o history; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
+ [ -n "$GH" ] && [ -n "$REPO" ] && \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=fileshare \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
+ unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+```
+
+#### telnet
+```bash
+ unset HISTFILE; set +o history; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
+ [ -n "$GH" ] && [ -n "$REPO" ] && \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=telnet \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
+ unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+```
+
+#### redis
+```bash
+ unset HISTFILE; set +o history; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
+ [ -n "$GH" ] && [ -n "$REPO" ] && \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=redis \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
+ unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+```
+
+#### docker
+```bash
+ unset HISTFILE; set +o history; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
+ [ -n "$GH" ] && [ -n "$REPO" ] && \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=docker \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
+ unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+```
+
+#### rdp
+```bash
+ unset HISTFILE; set +o history; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
+ [ -n "$GH" ] && [ -n "$REPO" ] && \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=rdp \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
+ unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+```
+
+#### esxi
+```bash
+ unset HISTFILE; set +o history; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
+ [ -n "$GH" ] && [ -n "$REPO" ] && \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=esxi \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
+ unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+```
+
+#### random
+```bash
+ unset HISTFILE; set +o history; \
+ read -rp "Node repo URL: " REPO; read -rsp "Token for that repo: " GH; echo; \
+ [ -n "$GH" ] && [ -n "$REPO" ] && \
+ export HP_GIT_TOKEN="$GH" HP_REPO="$REPO" HP_TYPE=random \
+        HP_NODE_NAME="$(hostname)" HP_NONINTERACTIVE=1 && \
+ curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/install.sh | sudo -E bash; \
+ unset GH REPO HP_GIT_TOKEN HP_REPO HP_TYPE HP_NODE_NAME HP_NONINTERACTIVE
+```
+
+</details>
+
+### Useful deploy-time extras
+
+```bash
+# Pin a specific agent name instead of a random one (must match
+# ^kworker-[a-z0-9]{1,4}$). Useful to re-claim a node's identity + logs repo.
+export HP_AGENT_NAME=kworker-a1
+
+# Point canary beacons (DOCX/XLSX/HTML bait) at a receiver you control.
+# Defaults to this host's own public IP if unset.
+export HP_CANARY_URL="http://203.0.113.10"
+
+# Tune local-log retention at install time (see Log retention below).
+export HP_LOG_RETENTION_DAYS=3      # session/IP jsonl age cap (days)
+export HP_EVENTS_MAX_MB=200         # events.jsonl size cap (MB)
+```
+
+After install, the operator summary and `/root/.agent-info` record the chosen
+agent name, profile, and node label.
+
+---
+
+## Update an existing honeypot
+
+`upgrade.sh` performs an in-place upgrade to the latest installer **without
+re-entering the repo URL or token** — it reads them from the node's existing
+per-node repo git config.
+
+**Preserves:** agent name (so the same `kworker-XXXX` → same logs repo), profile
+type, logs repo URL + token, and the node label.
+**Replaces:** all code under `/opt/<name>`, the systemd units, the rsyslog
+filter, and the privsep users (recreated identically). A **new**
+`fake_world.json` is generated (the per-VM universe changes) unless you pass
+`--keep-universe`.
+
+```bash
+# Interactive confirmation, regenerate the fake universe
+sudo bash upgrade.sh
+
+# No prompts
+sudo bash upgrade.sh --yes
+
+# No prompts, and keep the existing fake universe (org name, secrets, roster)
+sudo bash upgrade.sh --yes --keep-universe
+
+# Pull the upgrade straight from GitHub (oneshot)
+curl -fsSL https://raw.githubusercontent.com/dcoyn/dcoyn_honeypot_deployer/main/upgrade.sh \
+  | sudo bash -s -- --yes --keep-universe
+
+# Upgrade from a non-default source (e.g. a fork or a pinned ref)
+sudo bash upgrade.sh --yes --installer-url=https://example.com/path/to/install.sh
+```
+
+**Alternative — clean reinstall keeping the same identity:** if you'd rather
+start fresh but keep the node pointed at the same logs repo, uninstall and
+reinstall with the same agent name and node label:
+
+```bash
+OLD=$(sudo awk -F= '/^agent_name/{print $2}' /root/.agent-info)
+NODE=$(sudo awk -F= '/^node_name/{print $2}' /root/.agent-info)
+sudo bash uninstall.sh "$OLD"
+export HP_AGENT_NAME="$OLD" HP_NODE_NAME="$NODE"   # reuse identity + repo
+sudo bash install.sh <profile>                      # re-enter repo URL + token
+```
+
+---
+
+## Log retention & disk usage
+
+The per-node git repo (pushed to GitHub every few minutes) is the **system of
+record**. The files under `/var/log/<agent>/` are a **local convenience cache**,
+so they're aged out automatically by a daily root-run timer
+(`<agent>-log-prune.timer`):
+
+- **`sessions/*.jsonl` and `by_ip/*.jsonl`** — independent per-session / per-IP
+  files. Deleted once older than `HP_LOG_RETENTION_DAYS` (default **3**). On a
+  busy node these are the bulk of the disk and inode usage.
+- **`events.jsonl`** — a single append-only file the aggregator reads by byte
+  offset. It is only truncated when it exceeds `HP_EVENTS_MAX_MB` (default
+  **200**) **and** the aggregator has already consumed it to EOF, with the sync
+  cursor reset in the same step. This guarantees no un-synced event is ever
+  dropped; if the aggregator is behind, the prune skips that file and tries
+  again next run.
+
+### Change the retention policy
+
+Edit the per-agent env file and the next daily run (or a manual run) picks it up:
+
+```bash
+NAME=$(sudo awk -F= '/^agent_name/{print $2}' /root/.agent-info)
+
+sudo sed -i 's/^HP_LOG_RETENTION_DAYS=.*/HP_LOG_RETENTION_DAYS=2/' /etc/${NAME}/env
+sudo sed -i 's/^HP_EVENTS_MAX_MB=.*/HP_EVENTS_MAX_MB=100/'        /etc/${NAME}/env
+
+# Apply now instead of waiting for the daily timer
+sudo systemctl start ${NAME}-log-prune.service
+sudo journalctl -u ${NAME}-log-prune.service -n 20 --no-pager
+
+# Current footprint
+sudo du -sh /var/log/${NAME} /var/log/${NAME}/sessions /var/log/${NAME}/by_ip
+```
+
+---
 
 ## Environment variables
 
-| Variable             | Default                          | Description |
-|----------------------|----------------------------------|-------------|
-| `HP_TYPE`            | (required)                       | `ssh` \| `owa` \| `winserver` \| `fileshare` \| `telnet` \| `redis` \| `docker` \| `rdp` \| `esxi` \| `random` |
-| `HP_CANARY_URL`      | (empty)                          | Base URL embedded in canary docs (DOCX/XLSX/HTML). Beacon hits land here when an attacker opens an exfiltrated file. Operator-controlled; e.g. another OWA honeypot's URL, or a canarytokens.org token URL, or a dedicated webhook receiver. |
-| `HP_REPO`            | (required)                       | Per-VM logs repo URL (`https://github.com/<owner>/<repo>.git`) |
-| `HP_GIT_TOKEN`       | (required)                       | PAT for `HP_REPO`, `Contents: Read+write` |
-| `HP_AGENT_NAME`      | randomly generated               | Force a specific agent name. Must match `^kworker-[a-z0-9]{1,4}$` |
-| `HP_NODE_NAME`       | `hostname-<random>`              | Free-form label written into every event |
-| `HP_SSH_PORT`        | `62222`                          | Port the real sshd moves to |
-| `HP_PCAP_IFACE`      | autodetected (`eth0` / `ens3`)   | Interface for the passive JA3/JA4 capture |
-| `HP_INSTALL_REPO`    | `https://github.com/dcoyn/dcoyn_honeypot_deployer.git` | Where install.sh fetches its source |
-| `HP_INSTALL_TOKEN`   | falls back to `HP_GIT_TOKEN`     | PAT for the deployer repo if it's private |
-| `HP_NONINTERACTIVE`  | `0`                              | `1` disables all prompts |
+| Variable                | Default                          | Description |
+|-------------------------|----------------------------------|-------------|
+| `HP_TYPE`               | (required)                       | `ssh` \| `owa` \| `winserver` \| `fileshare` \| `telnet` \| `redis` \| `docker` \| `rdp` \| `esxi` \| `random` (may also be passed as the first positional arg) |
+| `HP_REPO`               | (required)                       | Per-VM logs repo URL (`https://github.com/<owner>/<repo>.git`) |
+| `HP_GIT_TOKEN`          | (required)                       | PAT for `HP_REPO`, `Contents: Read+write` |
+| `HP_CANARY_URL`         | this host's public IP            | Base URL embedded in canary docs (DOCX/XLSX/HTML). Beacon hits land here when an attacker opens an exfiltrated file. Operator-controlled; e.g. another OWA honeypot's URL, a canarytokens.org token URL, or a dedicated webhook receiver. |
+| `HP_AGENT_NAME`         | randomly generated               | Force a specific agent name. Must match `^kworker-[a-z0-9]{1,4}$` |
+| `HP_NODE_NAME`          | `hostname-<random>`              | Free-form label written into every event |
+| `HP_SSH_PORT`           | `62222`                          | Port the real sshd moves to (ssh/fileshare/esxi/winserver) |
+| `HP_PCAP_IFACE`         | autodetected (`eth0` / `ens3`)   | Interface for the passive JA3/JA4 capture |
+| `HP_LOG_RETENTION_DAYS` | `3`                              | Age cap (days) for `sessions/` and `by_ip/` jsonl files in the local cache |
+| `HP_EVENTS_MAX_MB`      | `200`                            | Size cap (MB) for `events.jsonl` before a cursor-safe truncate |
+| `HP_INSTALL_REPO`       | `https://github.com/dcoyn/dcoyn_honeypot_deployer.git` | Where install.sh fetches its source |
+| `HP_INSTALL_TOKEN`      | falls back to `HP_GIT_TOKEN`     | PAT for the deployer repo if it's private |
+| `HP_NONINTERACTIVE`     | `0`                              | `1` disables all prompts |
 
 ## Agent naming
 
@@ -149,10 +327,11 @@ Each VM gets an agent name matching `^kworker-[a-z0-9]{1,4}$` — generated
 fresh on every install unless `HP_AGENT_NAME` is set. The name is used for:
 
 - `/opt/kworker-XXXX/` — install root
-- `/var/log/kworker-XXXX/` — event logs
+- `/var/log/kworker-XXXX/` — event logs (local cache)
 - `/var/lib/kworker-XXXX/` — state, repo clone, token
 - `/etc/kworker-XXXX/env` — systemd environment file
-- Systemd units (`kworker-XXXX.service`, `-capture`, `-connlog`, `-sync.timer`)
+- Systemd units (`kworker-XXXX.service`, `-capture`, `-connlog`,
+  `-sync.timer`, `-geoip-refresh.timer`, `-log-prune.timer`)
 - Python package directory (`kworker_XXXX`, dashes → underscores)
 - nftables log prefix (`KWORKER_XXXX_TCP `, etc.)
 - rsyslog filter (`/etc/rsyslog.d/30-kworker-XXXX.conf`)
@@ -161,7 +340,7 @@ The string `honeypot` does not appear anywhere in the deployed artifact.
 
 ## Privilege separation
 
-Four services, each as a separate unprivileged account:
+Three runtime services, each as a separate unprivileged account:
 
 | User              | Service               | Capabilities | Notes |
 |-------------------|-----------------------|--------------|-------|
@@ -170,11 +349,19 @@ Four services, each as a separate unprivileged account:
 | `kworker-XXXX-y`  | git push (every 5 min) | none | only reader of the GitHub token |
 | `kworker-XXXX-rw` | shared group          | — | setgid on log dir |
 
-Every unit sets `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
-`PrivateTmp`, `PrivateDevices`, `ProtectKernel{Tunables,Modules,Logs}`,
-`ProtectControlGroups`, `RestrictNamespaces`, `RestrictRealtime`,
-`RestrictSUIDSGID`, `LockPersonality`, plus explicit
-`ReadOnlyPaths`/`ReadWritePaths`.
+Two maintenance timers run as **root** oneshots, kept minimal and sandboxed
+(`ProtectSystem=strict`, `NoNewPrivileges`, explicit `ReadWritePaths`):
+
+| Unit                          | Schedule           | Job |
+|-------------------------------|--------------------|-----|
+| `kworker-XXXX-geoip-refresh`  | weekly (+≤4 h jitter) | re-download GeoLite2 City/ASN MMDBs |
+| `kworker-XXXX-log-prune`      | daily (+≤1 h jitter)  | age out the local `/var/log` cache (see [Log retention](#log-retention--disk-usage)) |
+
+Every runtime unit sets `NoNewPrivileges`, `ProtectSystem=strict`,
+`ProtectHome`, `PrivateTmp`, `PrivateDevices`,
+`ProtectKernel{Tunables,Modules,Logs}`, `ProtectControlGroups`,
+`RestrictNamespaces`, `RestrictRealtime`, `RestrictSUIDSGID`,
+`LockPersonality`, plus explicit `ReadOnlyPaths`/`ReadWritePaths`.
 
 Token at `/var/lib/kworker-XXXX/.token` is mode `0400` owned by the sync
 user. Sensor and connlog processes cannot read it.
@@ -184,34 +371,70 @@ user. Sensor and connlog processes cannot read it.
 ```bash
 NAME=$(sudo awk -F= '/^agent_name/{print $2}' /root/.agent-info)
 
-# unit health
-sudo systemctl is-active ${NAME} ${NAME}-capture ${NAME}-connlog ${NAME}-sync.timer
+# unit health (runtime services + all timers)
+sudo systemctl is-active ${NAME} ${NAME}-capture ${NAME}-connlog \
+     ${NAME}-sync.timer ${NAME}-geoip-refresh.timer ${NAME}-log-prune.timer
+
+# all timers and when they next fire
+sudo systemctl list-timers "${NAME}-*" --all
 
 # live events
 sudo tail -F /var/log/${NAME}/events.jsonl
 
-# journal
+# journal (main sensor)
 sudo journalctl -u ${NAME} -f
 
-# port bindings
-sudo ss -tlnp | grep -E ':(22|62222)\s'
+# what's actually listening (swap the ports for your profile)
+sudo ss -tlnp | grep -E ':(22|23|80|443|445|2375|3389|6379|62222)\s'
 
-# force a sync now
+# force a sync now, then check the last commits in the local repo clone
 sudo systemctl start ${NAME}-sync.service
 sudo -u ${NAME}-y git -C /var/lib/${NAME}/store log --oneline -5
+
+# run / inspect the log-prune now
+sudo systemctl start ${NAME}-log-prune.service
+sudo journalctl -u ${NAME}-log-prune.service -n 20 --no-pager
+
+# disk footprint of the local cache
+sudo du -sh /var/log/${NAME} /var/log/${NAME}/{sessions,by_ip} 2>/dev/null
 
 # install log
 sudo less /var/log/agent-install-*.log
 ```
 
+## Troubleshooting
+
+- **Locked out over SSH after install.** On `ssh`/`fileshare`/`esxi`/`winserver`
+  (and `random` when it picked one of those), the real admin sshd is on
+  **62222**: `ssh -p 62222 you@host`.
+- **Sync keeps failing.** `sudo journalctl -u ${NAME}-sync` — the token needs
+  `Contents: Read+write` on *that* repo, and the very first push may need to
+  create the branch. Confirm the remote: `sudo -u ${NAME}-y git -C
+  /var/lib/${NAME}/store remote -v`.
+- **No events showing up.** Check the sensor is active
+  (`systemctl is-active ${NAME}`), that it's listening on the expected ports
+  (`ss -tlnp`), and that the cloud firewall/security group actually allows
+  inbound to those ports.
+- **`-capture` or `-connlog` inactive.** These degrade gracefully (you lose TLS
+  fingerprinting / the nftables connection log, respectively); the main sensor
+  still runs. The journal for each unit explains why.
+- **Disk filling up.** Lower `HP_LOG_RETENTION_DAYS` / `HP_EVENTS_MAX_MB` in
+  `/etc/${NAME}/env` and run `sudo systemctl start ${NAME}-log-prune.service`.
+  See [Log retention](#log-retention--disk-usage).
+
 ## Uninstall
 
 Rolls back sshd_config, flushes nftables, removes users/groups and all
-`/opt`, `/var/log`, `/var/lib`, `/etc` artifacts for the agent.
+`/opt`, `/var/log`, `/var/lib`, `/etc` artifacts (and the geoip/log-prune
+scripts and units) for the agent. The install log is left in place for
+forensics.
 
 ```bash
 # remove the install named in /root/.agent-info
 sudo bash uninstall.sh
+
+# remove a specific agent
+sudo bash uninstall.sh kworker-x4z
 
 # remove every kworker-* install on this host
 sudo bash uninstall.sh --all
@@ -226,8 +449,9 @@ sessions/<sid>.json                  # one file per session
 node.json                            # heartbeat + counters
 ```
 
-`.git/hp-state.json` exists locally as the sync cursor but is never tracked
-by git (anything under `.git/` is ignored by definition).
+`.git/hp-state.json` exists locally as the sync cursor (the last-processed byte
+offset into `events.jsonl`) but is never tracked by git — anything under
+`.git/` is ignored by definition.
 
 ## Event schema
 
@@ -322,13 +546,14 @@ Plus the supporting evidence behind the verdict:
 
 ```
 install.sh                          # installer entrypoint
+upgrade.sh                          # in-place upgrade (keeps name/profile/repo/token)
 uninstall.sh                        # rollback
 requirements.txt
 nodewatch/                          # renamed to kworker_XXXX at install
   config.py
   runner.py
   core/
-    logger.py                       # jsonl event sink
+    logger.py                       # jsonl event sink (events.jsonl + sessions/ + by_ip/)
     session.py                      # sliding-window per-IP session tracker
     enrichment.py                   # PTR + GeoIP/ASN lookup
     fingerprint.py                  # JA3 + JA4 (TLS) + HASSH (SSH KEXINIT)
@@ -347,6 +572,7 @@ nodewatch/                          # renamed to kworker_XXXX at install
     esxi_shell.py                   # ESXi shell personality (esxcli/vim-cmd, SSH 22)
     win_shell.py                    # Windows cmd/PowerShell shell personality (SSH 22)
     beacon.py                       # universal canary beacon receiver (non-HTTP profiles)
+    fake_fs.py / fake_system.py / fake_world.py  # the per-VM fake universe
   network/
     packet_capture.py               # scapy sniffer → JA3/JA4 + HASSH
     connection_logger.py            # nftables log tailer
